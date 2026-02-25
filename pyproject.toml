@@ -16,11 +16,19 @@ classifiers = [
     
 ]
 dependencies = [
+    "folium>=0.20.0",
+    "geopandas>=1.1.2",
+    "matplotlib>=3.10.8",
     "mkdocs",
+    "networkx>=3.4.2",
+    "osmnx==1.9.1",
     "pip",
     "pytest",
     "python-dotenv",
+    "requests>=2.32.5",
     "ruff",
+    "scikit-learn>=1.7.2",
+    "shapely>=2.1.2",
 ]
 requires-python = "~=3.10.0"
 

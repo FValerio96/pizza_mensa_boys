@@ -1,0 +1,593 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SafeWalk Bari — Chatbot</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; height: 100vh; overflow: hidden; }
+
+        /* ── Layout ────────────────────────────────────── */
+        .container { display: flex; height: 100vh; }
+        .chat-panel {
+            width: 420px; min-width: 340px;
+            display: flex; flex-direction: column;
+            background: #f8f9fa; border-right: 1px solid #dee2e6;
+        }
+        .map-panel { flex: 1; position: relative; display: flex; flex-direction: column; }
+
+        /* ── Chat header ───────────────────────────────── */
+        .chat-header {
+            background: linear-gradient(135deg, #2c3e50 0%, #34495e 100%);
+            color: #fff; padding: 16px 20px;
+            display: flex; align-items: center; justify-content: space-between;
+        }
+        .chat-header h2 { font-size: 18px; font-weight: 700; }
+        .chat-header p  { font-size: 12px; opacity: .75; margin-top: 2px; }
+        .btn-reset {
+            background: rgba(255,255,255,.15); border: 1px solid rgba(255,255,255,.3);
+            color: #fff; border-radius: 8px; padding: 6px 14px; cursor: pointer;
+            font-size: 13px; transition: .2s;
+        }
+        .btn-reset:hover { background: rgba(255,255,255,.25); }
+
+        /* ── Chat messages ─────────────────────────────── */
+        .chat-messages {
+            flex: 1; overflow-y: auto; padding: 16px 14px;
+            display: flex; flex-direction: column; gap: 10px;
+            scroll-behavior: smooth;
+        }
+        .msg { display: flex; align-items: flex-end; gap: 8px; }
+        .msg.bot  { justify-content: flex-start; }
+        .msg.user { justify-content: flex-end; }
+
+        .bubble {
+            max-width: 88%; padding: 10px 14px; border-radius: 16px;
+            line-height: 1.55; font-size: 14px; word-break: break-word;
+        }
+        .bot .bubble {
+            background: #fff; border: 1px solid #dee2e6;
+            border-bottom-left-radius: 4px; color: #212529;
+        }
+        .user .bubble {
+            background: #3498db; color: #fff;
+            border-bottom-right-radius: 4px;
+        }
+        .bubble b { font-weight: 600; }
+        .bubble table { margin-top: 6px; font-size: 13px; }
+        .bubble table th, .bubble table td {
+            padding: 2px 10px; border-bottom: 1px solid #eee;
+        }
+
+        /* ── Typing indicator ──────────────────────────── */
+        .typing { display: flex; gap: 4px; padding: 6px 14px; }
+        .typing span {
+            width: 8px; height: 8px; background: #95a5a6; border-radius: 50%;
+            animation: bounce .6s infinite alternate;
+        }
+        .typing span:nth-child(2) { animation-delay: .2s; }
+        .typing span:nth-child(3) { animation-delay: .4s; }
+        @keyframes bounce { to { opacity: .3; transform: translateY(-4px); } }
+
+        /* ── Input bar ─────────────────────────────────── */
+        .chat-input {
+            padding: 12px 14px; background: #fff;
+            border-top: 1px solid #dee2e6;
+            display: flex; gap: 8px; align-items: center;
+        }
+        .chat-input input {
+            flex: 1; padding: 10px 16px; border: 1px solid #dee2e6;
+            border-radius: 24px; outline: none; font-size: 14px;
+            transition: border-color .2s;
+        }
+        .chat-input input:focus { border-color: #3498db; }
+        .chat-input button {
+            background: #3498db; color: #fff; border: none;
+            border-radius: 50%; width: 40px; height: 40px;
+            cursor: pointer; font-size: 18px; display: flex;
+            align-items: center; justify-content: center; transition: .2s;
+        }
+        .chat-input button:hover { background: #2980b9; }
+
+        /* ── Suggestion chips ──────────────────────────── */
+        .suggestions {
+            display: flex; flex-wrap: wrap; gap: 6px; padding: 0 14px 10px;
+        }
+        .sugg-chip {
+            background: #eef6ff; border: 1px solid #b8daff;
+            border-radius: 16px; padding: 5px 12px;
+            cursor: pointer; font-size: 12px; color: #2c6fbb; transition: .2s;
+        }
+        .sugg-chip:hover { background: #d4e9ff; }
+
+        /* ── Map toolbar ───────────────────────────────── */
+        .map-toolbar {
+            background: linear-gradient(135deg, #2c3e50 0%, #34495e 100%);
+            padding: 10px 16px; display: flex; align-items: center;
+            gap: 12px; flex-wrap: wrap; color: #fff; z-index: 1000;
+        }
+        .map-toolbar label { font-size: 13px; font-weight: 600; }
+        .toolbar-group {
+            display: flex; align-items: center; gap: 6px;
+            background: rgba(255,255,255,.1); border-radius: 8px;
+            padding: 6px 12px;
+        }
+        .toolbar-group input[type=number] {
+            width: 50px; padding: 4px 6px; border: 1px solid rgba(255,255,255,.3);
+            border-radius: 6px; background: rgba(255,255,255,.15);
+            color: #fff; font-size: 14px; text-align: center; outline: none;
+        }
+        .toolbar-group input[type=number]:focus {
+            border-color: #3498db; background: rgba(255,255,255,.25);
+        }
+        .toolbar-group select {
+            padding: 4px 8px; border: 1px solid rgba(255,255,255,.3);
+            border-radius: 6px; background: rgba(255,255,255,.15);
+            color: #fff; font-size: 13px; outline: none; cursor: pointer;
+        }
+        .toolbar-group select option { color: #333; background: #fff; }
+
+        .pin-indicator {
+            display: flex; align-items: center; gap: 4px;
+            font-size: 12px; opacity: .85;
+        }
+        .pin-dot {
+            width: 10px; height: 10px; border-radius: 50%;
+            border: 2px solid #fff;
+        }
+        .pin-dot.green { background: #2ecc71; }
+        .pin-dot.red   { background: #e74c3c; }
+        .pin-dot.empty { background: transparent; }
+
+        .btn-go {
+            background: #2ecc71; color: #fff; border: none;
+            border-radius: 8px; padding: 8px 20px; font-size: 14px;
+            font-weight: 700; cursor: pointer; transition: .2s;
+            margin-left: auto;
+        }
+        .btn-go:hover { background: #27ae60; }
+        .btn-go:disabled { background: #7f8c8d; cursor: not-allowed; }
+
+        /* ── Map container ─────────────────────────────── */
+        #mapContainer { flex: 1; position: relative; }
+        #selectionMap { width: 100%; height: 100%; }
+        #routeMapFrame { width: 100%; height: 100%; border: none; display: none; }
+        .btn-back-map {
+            position: absolute; top: 10px; right: 10px; z-index: 1001;
+            background: #fff; border: 2px solid #3498db; border-radius: 8px;
+            padding: 6px 14px; font-size: 13px; cursor: pointer;
+            font-weight: 600; color: #3498db; display: none;
+            box-shadow: 0 2px 8px rgba(0,0,0,.2);
+        }
+        .btn-back-map:hover { background: #3498db; color: #fff; }
+
+        /* ── Responsive ────────────────────────────────── */
+        @media (max-width: 800px) {
+            .container { flex-direction: column; }
+            .chat-panel { width: 100%; height: 50%; min-width: unset; }
+            .map-panel { height: 50%; }
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <!-- ═══════ CHAT PANEL ═══════ -->
+    <div class="chat-panel">
+        <div class="chat-header">
+            <div>
+                <h2>🚶 SafeWalk Bari</h2>
+                <p>Assistente per la mobilità sicura</p>
+            </div>
+            <button class="btn-reset" onclick="resetAll()">🔄 Nuovo</button>
+        </div>
+
+        <div class="chat-messages" id="chatMessages"></div>
+
+        <div class="suggestions" id="suggestions" style="display:none;"></div>
+
+        <div class="chat-input">
+            <input type="text" id="userInput"
+                   placeholder="Scrivi un messaggio..."
+                   autocomplete="off" />
+            <button onclick="sendMessage()" title="Invia">➤</button>
+        </div>
+    </div>
+
+    <!-- ═══════ MAP PANEL ═══════ -->
+    <div class="map-panel">
+        <!-- Toolbar -->
+        <div class="map-toolbar" id="mapToolbar">
+            <div class="pin-indicator">
+                <div class="pin-dot green" id="pinStart"></div>
+                <span id="pinStartLabel">Partenza: clicca</span>
+            </div>
+            <div class="pin-indicator">
+                <div class="pin-dot red" id="pinEnd"></div>
+                <span id="pinEndLabel">Arrivo: clicca</span>
+            </div>
+
+            <div class="toolbar-group">
+                <label>🕐</label>
+                <input type="number" id="oraInput" min="0" max="23" value="12" />
+            </div>
+
+            <div class="toolbar-group">
+                <label>Percorso</label>
+                <select id="tipoSelect">
+                    <option value="completo">📋 Completo</option>
+                    <option value="veloce">🚌 Veloce (Bus)</option>
+                    <option value="sostenibile">🚲 Sostenibile (Bici)</option>
+                </select>
+            </div>
+
+            <button class="btn-go" id="btnGo" disabled onclick="computeRoute()">
+                Calcola ➤
+            </button>
+        </div>
+
+        <!-- Map area -->
+        <div id="mapContainer">
+            <div id="selectionMap"></div>
+            <iframe id="routeMapFrame"></iframe>
+            <button class="btn-back-map" id="btnBackMap" onclick="showSelectionMap()">
+                ← Torna alla selezione
+            </button>
+        </div>
+    </div>
+</div>
+
+<script>
+// ══════════════════════════════════════════════════════════════════
+//  STATE
+// ══════════════════════════════════════════════════════════════════
+let originCoords = null;   // [lat, lon]
+let destCoords = null;     // [lat, lon]
+let clickMode = 'origin';  // 'origin' | 'dest'
+let computedResult = null;
+let markerStart = null;
+let markerDest = null;
+let selMap = null;
+
+// ══════════════════════════════════════════════════════════════════
+//  INIT
+// ══════════════════════════════════════════════════════════════════
+window.addEventListener('load', () => {
+    initMap();
+    addBotMessage(
+        "Ciao! 👋 Sono <b>SafeWalk</b>, il tuo assistente per muoverti " +
+        "in sicurezza a Bari.<br><br>" +
+        "📍 <b>Clicca sulla mappa</b> per selezionare il punto di <b>partenza</b> " +
+        "(verde) e poi il punto di <b>arrivo</b> (rosso).<br>" +
+        "Scegli orario e tipo di percorso nella barra in alto, poi premi <b>Calcola</b>."
+    );
+    document.getElementById('userInput').focus();
+});
+
+function initMap() {
+    selMap = L.map('selectionMap', {
+        center: [41.1171, 16.8719],
+        zoom: 14,
+        zoomControl: true,
+    });
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '&copy; OpenStreetMap',
+        maxZoom: 19,
+    }).addTo(selMap);
+
+    selMap.on('click', onMapClick);
+
+    // Fix per mappa che non si renderizza correttamente
+    setTimeout(() => selMap.invalidateSize(), 200);
+}
+
+// ══════════════════════════════════════════════════════════════════
+//  MAP CLICK HANDLING
+// ══════════════════════════════════════════════════════════════════
+const greenIcon = L.divIcon({
+    className: '',
+    html: '<div style="width:18px;height:18px;background:#2ecc71;border:3px solid #fff;border-radius:50%;box-shadow:0 2px 6px rgba(0,0,0,.4);"></div>',
+    iconSize: [18, 18], iconAnchor: [9, 9],
+});
+const redIcon = L.divIcon({
+    className: '',
+    html: '<div style="width:18px;height:18px;background:#e74c3c;border:3px solid #fff;border-radius:50%;box-shadow:0 2px 6px rgba(0,0,0,.4);"></div>',
+    iconSize: [18, 18], iconAnchor: [9, 9],
+});
+
+function onMapClick(e) {
+    const lat = Math.round(e.latlng.lat * 100000) / 100000;
+    const lon = Math.round(e.latlng.lng * 100000) / 100000;
+
+    if (clickMode === 'origin') {
+        originCoords = [lat, lon];
+        if (markerStart) selMap.removeLayer(markerStart);
+        markerStart = L.marker([lat, lon], { icon: greenIcon, draggable: true })
+            .addTo(selMap)
+            .bindPopup('<b>Partenza</b><br>' + lat + ', ' + lon).openPopup();
+        markerStart.on('dragend', function(ev) {
+            const p = ev.target.getLatLng();
+            originCoords = [Math.round(p.lat*100000)/100000, Math.round(p.lng*100000)/100000];
+            ev.target.setPopupContent('<b>Partenza</b><br>' + originCoords[0] + ', ' + originCoords[1]);
+            updatePinLabels();
+        });
+
+        document.getElementById('pinStartLabel').textContent = 'Partenza: \u2713';
+        document.getElementById('pinStart').classList.remove('empty');
+        clickMode = 'dest';
+        addBotMessage(
+            '\ud83d\udccd Partenza selezionata! <b>(' + lat + ', ' + lon + ')</b><br>' +
+            'Ora clicca il punto di <b>arrivo</b> (rosso).'
+        );
+    } else {
+        destCoords = [lat, lon];
+        if (markerDest) selMap.removeLayer(markerDest);
+        markerDest = L.marker([lat, lon], { icon: redIcon, draggable: true })
+            .addTo(selMap)
+            .bindPopup('<b>Arrivo</b><br>' + lat + ', ' + lon).openPopup();
+        markerDest.on('dragend', function(ev) {
+            const p = ev.target.getLatLng();
+            destCoords = [Math.round(p.lat*100000)/100000, Math.round(p.lng*100000)/100000];
+            ev.target.setPopupContent('<b>Arrivo</b><br>' + destCoords[0] + ', ' + destCoords[1]);
+            updatePinLabels();
+        });
+
+        document.getElementById('pinEndLabel').textContent = 'Arrivo: \u2713';
+        document.getElementById('pinEnd').classList.remove('empty');
+        clickMode = 'origin';  // next click resets origin
+        addBotMessage(
+            '\ud83d\udccd Arrivo selezionato! <b>(' + lat + ', ' + lon + ')</b><br>' +
+            'Scegli orario e tipo di percorso, poi premi <b>Calcola \u27a4</b>.'
+        );
+    }
+    updateGoButton();
+}
+
+function updatePinLabels() {
+    if (originCoords) {
+        document.getElementById('pinStartLabel').textContent = 'Partenza: \u2713';
+    }
+    if (destCoords) {
+        document.getElementById('pinEndLabel').textContent = 'Arrivo: \u2713';
+    }
+    updateGoButton();
+}
+
+function updateGoButton() {
+    document.getElementById('btnGo').disabled = !(originCoords && destCoords);
+}
+
+// ══════════════════════════════════════════════════════════════════
+//  COMPUTE ROUTE
+// ══════════════════════════════════════════════════════════════════
+async function computeRoute() {
+    if (!originCoords || !destCoords) return;
+
+    const ora = parseInt(document.getElementById('oraInput').value) || 12;
+    const tipo = document.getElementById('tipoSelect').value;
+    const labels = {
+        veloce: '\ud83d\ude8c Veloce (Bus)',
+        sostenibile: '\ud83d\udeb2 Sostenibile (Bici)',
+        completo: '\ud83d\udccb Completo (Entrambi)',
+    };
+
+    addUserMessage('Partenza (' + originCoords[0] + ', ' + originCoords[1] + ') \u2192 ' +
+                    'Arrivo (' + destCoords[0] + ', ' + destCoords[1] + ') \u2014 ' +
+                    ora + ':00 \u2014 ' + labels[tipo]);
+
+    showTyping();
+    addBotMessage('\u23f3 Sto calcolando il percorso migliore, un attimo di pazienza\u2026');
+
+    document.getElementById('btnGo').disabled = true;
+
+    try {
+        const resp = await fetch('/api/compute', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                origin_coords: originCoords,
+                dest_coords: destCoords,
+                orario: ora,
+                tipo: tipo,
+            }),
+        });
+        const result = await resp.json();
+        hideTyping();
+
+        if (result.error) {
+            addBotMessage('\u274c ' + result.error);
+            document.getElementById('btnGo').disabled = false;
+            return;
+        }
+
+        computedResult = result;
+
+        // Show route map in iframe
+        showRouteMap(result.map_url);
+
+        // Show summary in chat
+        addBotMessage(result.summary);
+
+        // Suggestion chips
+        showSuggestions([
+            "Qual \u00e8 il pi\u00f9 sicuro?",
+            "Quanto tempo ci mette?",
+            "Quale bus devo prendere?",
+            "Impatto ecologico?",
+            "Consigliami un percorso",
+            "Confronto bici vs bus",
+        ]);
+
+    } catch (err) {
+        hideTyping();
+        addBotMessage('\u274c Errore di comunicazione col server: ' + err.message);
+    }
+    document.getElementById('btnGo').disabled = !(originCoords && destCoords);
+}
+
+// ══════════════════════════════════════════════════════════════════
+//  MAP SWITCHING (selection <-> route)
+// ══════════════════════════════════════════════════════════════════
+function showRouteMap(url) {
+    document.getElementById('selectionMap').style.display = 'none';
+    const frame = document.getElementById('routeMapFrame');
+    frame.src = url;
+    frame.style.display = 'block';
+    document.getElementById('btnBackMap').style.display = 'block';
+}
+
+function showSelectionMap() {
+    document.getElementById('routeMapFrame').style.display = 'none';
+    document.getElementById('routeMapFrame').src = '';
+    document.getElementById('selectionMap').style.display = 'block';
+    document.getElementById('btnBackMap').style.display = 'none';
+    setTimeout(() => selMap.invalidateSize(), 100);
+}
+
+// ══════════════════════════════════════════════════════════════════
+//  CHAT HELPERS
+// ══════════════════════════════════════════════════════════════════
+function scrollBottom() {
+    const c = document.getElementById('chatMessages');
+    setTimeout(() => c.scrollTop = c.scrollHeight, 60);
+}
+
+function addBotMessage(html) {
+    const c = document.getElementById('chatMessages');
+    const div = document.createElement('div');
+    div.className = 'msg bot';
+    div.innerHTML = '<div class="bubble">' + html + '</div>';
+    c.appendChild(div);
+    scrollBottom();
+}
+
+function addUserMessage(text) {
+    const c = document.getElementById('chatMessages');
+    const div = document.createElement('div');
+    div.className = 'msg user';
+    div.innerHTML = '<div class="bubble">' + escapeHtml(text) + '</div>';
+    c.appendChild(div);
+    scrollBottom();
+}
+
+function showTyping() {
+    const c = document.getElementById('chatMessages');
+    const div = document.createElement('div');
+    div.className = 'msg bot';
+    div.id = 'typingIndicator';
+    div.innerHTML = '<div class="bubble"><div class="typing"><span></span><span></span><span></span></div></div>';
+    c.appendChild(div);
+    scrollBottom();
+}
+
+function hideTyping() {
+    const el = document.getElementById('typingIndicator');
+    if (el) el.remove();
+}
+
+function showSuggestions(items) {
+    const box = document.getElementById('suggestions');
+    box.innerHTML = items.map(function(t) {
+        return '<span class="sugg-chip" onclick="quickSend(\'' + escapeHtml(t) + '\')">' + t + '</span>';
+    }).join('');
+    box.style.display = 'flex';
+}
+
+function hideSuggestions() {
+    document.getElementById('suggestions').style.display = 'none';
+}
+
+function escapeHtml(s) {
+    return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+
+function quickSend(text) {
+    document.getElementById('userInput').value = text;
+    sendMessage();
+}
+
+// ══════════════════════════════════════════════════════════════════
+//  SEND MESSAGE (chat for follow-up discussion)
+// ══════════════════════════════════════════════════════════════════
+async function sendMessage() {
+    const input = document.getElementById('userInput');
+    const text = input.value.trim();
+    if (!text) return;
+    input.value = '';
+    hideSuggestions();
+    addUserMessage(text);
+
+    if (!computedResult) {
+        addBotMessage(
+            'Non ho ancora calcolato un percorso.<br>' +
+            '\ud83d\udccd Clicca sulla mappa per selezionare partenza e arrivo, poi premi <b>Calcola</b>.'
+        );
+        return;
+    }
+
+    // Follow-up discussion
+    showTyping();
+    try {
+        const resp = await fetch('/api/chat', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ message: text, result: computedResult }),
+        });
+        const data = await resp.json();
+        hideTyping();
+        addBotMessage(data.response);
+        showSuggestions([
+            "Tempo?", "Sicurezza?", "Bus?", "Bici?", "CO\u2082?",
+            "Consiglio?", "Confronto?",
+        ]);
+    } catch (err) {
+        hideTyping();
+        addBotMessage('Mi dispiace, non sono riuscito a elaborare la risposta.');
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════
+//  RESET
+// ══════════════════════════════════════════════════════════════════
+function resetAll() {
+    // Reset state
+    originCoords = null;
+    destCoords = null;
+    clickMode = 'origin';
+    computedResult = null;
+
+    // Reset markers
+    if (markerStart) { selMap.removeLayer(markerStart); markerStart = null; }
+    if (markerDest)  { selMap.removeLayer(markerDest);  markerDest = null; }
+
+    // Reset toolbar
+    document.getElementById('pinStartLabel').textContent = 'Partenza: clicca';
+    document.getElementById('pinEndLabel').textContent = 'Arrivo: clicca';
+    document.getElementById('btnGo').disabled = true;
+    document.getElementById('oraInput').value = 12;
+    document.getElementById('tipoSelect').value = 'completo';
+
+    // Show selection map
+    showSelectionMap();
+
+    // Reset chat
+    document.getElementById('chatMessages').innerHTML = '';
+    hideSuggestions();
+    addBotMessage(
+        'Ciao! \ud83d\udc4b Sono <b>SafeWalk</b>, il tuo assistente per muoverti ' +
+        'in sicurezza a Bari.<br><br>' +
+        '\ud83d\udccd <b>Clicca sulla mappa</b> per selezionare il punto di <b>partenza</b> ' +
+        '(verde) e poi il punto di <b>arrivo</b> (rosso).<br>' +
+        'Scegli orario e tipo di percorso nella barra in alto, poi premi <b>Calcola</b>.'
+    );
+}
+
+// Enter key
+document.getElementById('userInput').addEventListener('keydown', function(e) {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+});
+</script>
+</body>
+</html>

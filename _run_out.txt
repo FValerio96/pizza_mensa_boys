@@ -1,0 +1,82 @@
+============================================================
+  SafeWalk — Routing Sicuro e Sostenibile per Bari
+============================================================
+
+📂 Caricamento grafo da cache...
+   ✅ Grafo caricato: 21247 nodi, 51306 archi
+
+📂 Caricamento lampioni da cache...
+   ✅ Lampioni trovati: 1376
+📂 Caricamento strade illuminate da cache...
+   ✅ Strade illuminate trovate: 1231
+📂 Caricamento linee bus da cache...
+   ✅ Linee bus: 37, fermate OSM con info linee: 889
+
+📂 Caricamento dati CSV...
+   Fermate bus: 1349 righe
+   Stazioni bike sharing: 32 righe
+   Orari transiti: 1000 righe
+   Consumi AMTAB: 1000 righe
+   ✅ Frequenza transiti calcolata: 256 combinazioni quartiere/ora
+   ✅ Consumo medio bus: 2.25 L/km
+      → CO₂ per veicolo: 5.9 kg/km
+      → CO₂ per passeggero (~30 pax): 0.195 kg/km
+
+🔧 Associazione fermate bus e bike sharing...
+   Fermate bus associate: 1349
+   Stazioni bike sharing associate: 32
+🔧 Arricchimento grafo con dati lampioni...
+   ✅ Archi con almeno 1 lampione: 8988/51306
+   ✅ Archi illuminati (is_lit): 8988/51306
+   ✅ Distribuzione sicurezza:
+      🟢 Sicuro (≥0.75):  1383
+      🟠 Medio (0.25-0.75): 12504
+      🔴 Pericolo (≤0.25): 37419
+
+============================================================
+  Inserisci i dati del percorso
+============================================================
+📍 Luogo di partenza: 📍 Luogo di destinazione: 🕐 Orario (0-23): 
+   Partenza:     Politecnico di Bari
+   Destinazione: Stazione Centrale di Bari
+   Orario:       14:00
+
+   📌 Partenza:     (41.10891, 16.87858)
+   📌 Destinazione: (41.11795, 16.87024)
+
+============================================================
+  🚲 PERCORSO BICI (sostenibile)
+============================================================
+   🚶 Cammina fino a: stazione Politecnico (3.0 min)
+   🚲 Pedala fino a:  stazione Stazione FF.SS. (7.3 min)
+   🚶 Cammina fino a destinazione (1.4 min)
+   Distanza: 2.43 km
+   Tempo:    11.8 min
+   Safety:   21.8%
+   CO₂:      0.0 kg
+
+============================================================
+  🚌 PERCORSO BUS
+============================================================
+   🚶 Cammina fino a: via Orabona ,Chiesa S. Marcello (2.7 min)
+   🚌 Bus [Linea 21, 35]: → Piazza  Moro ,F.S. (3.3 min)
+   🚶 Cammina fino a destinazione (0.8 min)
+   Distanza totale: 1.93 km
+   Tempo totale:    6.9 min
+   Safety:          41.8%
+   CO₂:             0.31 kg
+
+🗺️  Generazione mappa interattiva...
+   ✅ Mappa salvata in: C:\Users\fonta\Desktop\pizza_mensa_boys\notebooks\output\safewalk_map.html
+
+============================================================
+  RIEPILOGO
+============================================================
+                              🚲 Bici           🚌 Bus
+-------------------------------------------------------
+       Distanza (km)            2.43            1.93
+         Tempo (min)            11.8             6.9
+          Safety (%)            21.8            41.8
+            CO₂ (kg)             0.0            0.31
+
+✅ Pipeline completata! Apri notebooks/output/safewalk_map.html

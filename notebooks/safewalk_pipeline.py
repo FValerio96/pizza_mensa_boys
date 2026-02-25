@@ -43,16 +43,10 @@ DATA_DIR = Path(__file__).parent.parent / "ai_challenge" / "data"
 OUTPUT_DIR = Path(__file__).parent / "output"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-# Bounding box per la zona di interesse (centro di Bari)
-BBOX_SOUTH = 41.10
-BBOX_NORTH = 41.15
-BBOX_WEST = 16.82
-BBOX_EAST = 16.90
-
 # Velocità medie (km/h)
 WALKING_SPEED_KMH = 5.0
-BUS_SPEED_KMH = 18.0
-BIKE_SPEED_KMH = 15.0
+BUS_SPEED_KMH = 30.0
+BIKE_SPEED_KMH = 17.0
 
 # Emissioni CO₂
 # Bus AMTAB: consumo medio ~2.2 L/km diesel → ~5.7 kg CO₂/km (per veicolo)
@@ -60,7 +54,7 @@ BIKE_SPEED_KMH = 15.0
 CO2_PIEDI_KG_PER_KM = 0.0
 CO2_BICI_KG_PER_KM = 0.0
 CO2_BUS_KG_PER_KM_PASSEGGERO = 0.19
-CO2_AUTO_KG_PER_KM = 0.12  # auto media per confronto
+CO2_AUTO_KG_PER_KM = 0.5  # auto media per confronto
 
 # Raggio per associare lampioni agli archi (in metri)
 LAMP_BUFFER_METERS = 30
@@ -73,18 +67,21 @@ def build_walking_graph(use_cache=True):
     """
     Scarica il grafo pedonale di Bari da OpenStreetMap usando osmnx.
     Se il cache esiste, lo carica da file.
+    Aggiunge il tag 'lit' (illuminazione) ai tag WAY scaricati.
     """
     cache_path = OUTPUT_DIR / "bari_walk_graph.graphml"
+
+    # Aggiungere 'lit' ai tag degli archi scaricati da OSM
+    default_tags = ox.settings.useful_tags_way
+    if "lit" not in default_tags:
+        ox.settings.useful_tags_way = list(default_tags) + ["lit"]
 
     if use_cache and cache_path.exists():
         print("📂 Caricamento grafo da cache...")
         G = ox.load_graphml(cache_path)
     else:
         print("🌐 Download grafo pedonale di Bari da OpenStreetMap...")
-        G = ox.graph_from_bbox(
-            bbox=(BBOX_NORTH, BBOX_SOUTH, BBOX_EAST, BBOX_WEST),
-            network_type="walk",
-        )
+        G = ox.graph_from_place("Bari, Italy", network_type="all")
         ox.save_graphml(G, cache_path)
         print(f"   Salvato in {cache_path}")
 
@@ -109,9 +106,10 @@ def fetch_street_lamps(use_cache=True):
             lamps = json.load(f)
     else:
         print("🌐 Download lampioni da Overpass API...")
-        query = f"""
+        query = """
         [out:json][timeout:60];
-        node["highway"="street_lamp"]({BBOX_SOUTH},{BBOX_WEST},{BBOX_NORTH},{BBOX_EAST});
+        area["name"="Bari"]["admin_level"="8"]->.bari;
+        node["highway"="street_lamp"](area.bari);
         out;
         """
         url = "https://overpass.kumi.systems/api/interpreter"
@@ -138,6 +136,154 @@ def lamps_to_geodataframe(lamps):
         crs="EPSG:4326",
     )
     return gdf.to_crs("EPSG:32633")
+
+
+def fetch_lit_ways(use_cache=True):
+    """
+    Scarica da Overpass gli ID delle way taggate lit=yes/24/7/automatic a Bari.
+    Ritorna un set di osmid (int).
+    """
+    cache_path = OUTPUT_DIR / "lit_ways.json"
+
+    if use_cache and cache_path.exists():
+        print("📂 Caricamento strade illuminate da cache...")
+        with open(cache_path, "r") as f:
+            lit_ids = json.load(f)
+    else:
+        print("🌐 Download strade illuminate (lit=yes) da Overpass API...")
+        query = """
+        [out:json][timeout:60];
+        area["name"="Bari"]["admin_level"="8"]->.bari;
+        way["lit"~"yes|24/7|automatic"](area.bari);
+        out ids;
+        """
+        url = "https://overpass.kumi.systems/api/interpreter"
+        response = requests.get(url, params={"data": query}, timeout=120)
+        data = response.json()
+        lit_ids = [e["id"] for e in data.get("elements", [])]
+
+        with open(cache_path, "w") as f:
+            json.dump(lit_ids, f)
+        print(f"   Salvati in {cache_path}")
+
+    lit_set = set(lit_ids)
+    print(f"   ✅ Strade illuminate trovate: {len(lit_set)}")
+    return lit_set
+
+
+def fetch_bus_routes(use_cache=True):
+    """
+    Scarica le linee bus (relazioni route=bus) da Overpass per Bari.
+    Costruisce un mapping dalle fermate OSM alle linee bus che le servono.
+    Ritorna (osm_bus_stops, line_info) dove:
+      - osm_bus_stops: lista di {lat, lon, lines: [ref, ...]}
+      - line_info: dict {ref: {"name": str}}
+    """
+    cache_path = OUTPUT_DIR / "bus_routes.json"
+
+    if use_cache and cache_path.exists():
+        print("📂 Caricamento linee bus da cache...")
+        with open(cache_path, "r") as f:
+            cached = json.load(f)
+        print(f"   ✅ Linee bus: {len(cached['line_info'])}, "
+              f"fermate OSM con info linee: {len(cached['osm_bus_stops'])}")
+        return cached["osm_bus_stops"], cached["line_info"]
+
+    print("🌐 Download linee bus da Overpass API...")
+    urls = [
+        "https://overpass-api.de/api/interpreter",
+        "https://overpass.kumi.systems/api/interpreter",
+    ]
+
+    def _overpass_query(query, retries=3, wait=10):
+        import time as _time
+        for attempt in range(retries):
+            for url in urls:
+                try:
+                    resp = requests.post(url, data={"data": query}, timeout=180)
+                    if resp.status_code == 200 and resp.text.strip().startswith("{"):
+                        return resp.json()
+                    if resp.status_code == 429:
+                        print(f"   ⏳ Rate limit, attendo {wait}s...")
+                        _time.sleep(wait)
+                except Exception:
+                    continue
+            if attempt < retries - 1:
+                print(f"   ⏳ Retry {attempt+2}/{retries} tra {wait}s...")
+                _time.sleep(wait)
+        return None
+
+    # Step 1: Scarica le relazioni bus con i loro membri
+    query1 = """
+    [out:json][timeout:120];
+    area["name"="Bari"]["admin_level"="8"]->.bari;
+    rel["type"="route"]["route"="bus"](area.bari);
+    out body;
+    """
+    data1 = _overpass_query(query1)
+    if not data1:
+        print("   ⚠️ Overpass non raggiungibile, nessuna info linee bus.")
+        return [], {}
+    routes = data1.get("elements", [])
+
+    # Step 2: Scarica le coordinate dei nodi fermata (stop + platform)
+    query2 = """
+    [out:json][timeout:60];
+    area["name"="Bari"]["admin_level"="8"]->.bari;
+    rel["type"="route"]["route"="bus"](area.bari)->.routes;
+    (node(r.routes:"stop"); node(r.routes:"platform"););
+    out;
+    """
+    data2 = _overpass_query(query2)
+    stop_nodes = data2.get("elements", []) if data2 else []
+    node_coords = {n["id"]: (n["lat"], n["lon"]) for n in stop_nodes}
+
+    # Parse: per ogni linea, estrai ref e fermate
+    line_info = {}
+    node_to_lines = {}  # osm_node_id -> set of line refs
+
+    for rel in routes:
+        tags = rel.get("tags", {})
+        ref = tags.get("ref", "").strip()
+        if not ref:
+            ref = tags.get("name", f"#{rel['id']}")
+        name = tags.get("name", ref)
+
+        if ref not in line_info:
+            line_info[ref] = {"name": name}
+
+        for member in rel.get("members", []):
+            role = member.get("role", "")
+            if member["type"] == "node" and (
+                "stop" in role or "platform" in role
+            ):
+                nid = member["ref"]
+                if nid not in node_to_lines:
+                    node_to_lines[nid] = set()
+                node_to_lines[nid].add(ref)
+
+    # Costruire lista osm_bus_stops
+    osm_bus_stops = []
+    for nid, lines in node_to_lines.items():
+        if nid in node_coords:
+            lat, lon = node_coords[nid]
+            osm_bus_stops.append({
+                "lat": lat,
+                "lon": lon,
+                "lines": sorted(lines),
+            })
+
+    cached = {
+        "osm_bus_stops": osm_bus_stops,
+        "line_info": line_info,
+    }
+    with open(cache_path, "w") as f:
+        json.dump(cached, f)
+    print(f"   Salvate in {cache_path}")
+
+    print(f"   ✅ Linee bus: {len(line_info)}, "
+          f"fermate OSM con info linee: {len(osm_bus_stops)}")
+    return osm_bus_stops, line_info
 
 
 # ===========================================================================
@@ -220,18 +366,22 @@ def compute_avg_bus_co2(consumi):
 # ===========================================================================
 # FASE 4: Arricchire il Grafo con Dati di Sicurezza
 # ===========================================================================
-def enrich_graph_with_lamps(G, lamp_gdf):
+def enrich_graph_with_lamps(G, lamp_gdf, lit_way_ids=None):
     """
     Per ogni arco del grafo, calcola la densità di lampioni
     (lampioni per km) entro un raggio di LAMP_BUFFER_METERS.
+    Marca anche is_lit=1 se l'osmid è tra le way illuminate.
     """
     print("🔧 Arricchimento grafo con dati lampioni...")
+    if lit_way_ids is None:
+        lit_way_ids = set()
 
     if lamp_gdf.empty:
         print("   ⚠️ Nessun lampione disponibile, imposto densità = 0")
         for u, v, k, data in G.edges(data=True, keys=True):
             data["lamp_density"] = 0.0
             data["lamp_count"] = 0
+            data["is_lit"] = 0
         return G
 
     # Convertire archi in GeoDataFrame proiettato in metri
@@ -251,24 +401,8 @@ def enrich_graph_with_lamps(G, lamp_gdf):
     )
 
     # Contare lampioni per arco (basato sull'indice)
-    lamp_counts = joined.groupby(joined.index).agg(
-        lamp_count=("index_right", "count")
-    )
-
-    # Dove non ci sono match (NaN in index_right), il count è comunque >= 1
-    # per via del left join — correggiamo i NaN
-    # Se index_right era NaN per un arco → 0 lampioni
-    for idx in lamp_counts.index:
-        row = joined.loc[idx] if idx in joined.index else None
-        if row is not None:
-            if isinstance(row, pd.DataFrame):
-                # Più righe → almeno un lampione
-                if row["index_right"].isna().all():
-                    lamp_counts.loc[idx, "lamp_count"] = 0
-            else:
-                # Una sola riga
-                if pd.isna(row["index_right"]):
-                    lamp_counts.loc[idx, "lamp_count"] = 0
+    # count() esclude automaticamente i NaN, quindi archi senza lampioni → 0
+    lamp_counts = joined.groupby(joined.index)["index_right"].count().rename("lamp_count")
 
     # Scrivere nel grafo
     edge_keys = list(G.edges(keys=True))
@@ -283,9 +417,23 @@ def enrich_graph_with_lamps(G, lamp_gdf):
                 idx = candidates[0]
 
         if idx is not None and idx in lamp_counts.index:
-            count = int(lamp_counts.loc[idx, "lamp_count"])
+            count = int(lamp_counts[idx])
         else:
             count = 0
+
+        # FALLBACK: Se non ci sono lampioni dal spatial join,
+        # controlla il tag "lit" già presente negli archi OSM.
+        # osmnx può salvare il valore come stringa, lista o stringa-lista da graphml
+        if count == 0:
+            lit_tag = G[u][v][k].get("lit", "no")
+            # Normalizzare: lista → primo elemento, stringified list → parse
+            if isinstance(lit_tag, list):
+                lit_tag = lit_tag[0] if lit_tag else "no"
+            lit_tag = str(lit_tag).strip("[']\" ")
+            if lit_tag in ("yes", "24/7", "automatic"):
+                length_km_fallback = G[u][v][k].get("length", 1) / 1000
+                # Stima approssimativa: ~1 lampione ogni 30m
+                count = max(1, int((length_km_fallback * 1000) / 30))
 
         length_km = G[u][v][k].get("length", 1) / 1000
         density = count / max(length_km, 0.001)
@@ -293,17 +441,85 @@ def enrich_graph_with_lamps(G, lamp_gdf):
         G[u][v][k]["lamp_count"] = count
         G[u][v][k]["lamp_density"] = density
 
-    # Calcolare il massimo per normalizzazione
+        # Marcare is_lit da Overpass lit ways (match per osmid)
+        osmid = G[u][v][k].get("osmid", None)
+        is_lit = False
+        if osmid is not None:
+            if isinstance(osmid, (list, tuple)):
+                is_lit = any(int(oid) in lit_way_ids for oid in osmid)
+            else:
+                is_lit = int(osmid) in lit_way_ids
+        # Se count > 0 da lampioni, consideriamo anche illuminato
+        if count > 0:
+            is_lit = True
+        G[u][v][k]["is_lit"] = int(is_lit)
+
+    # --- Calcolo safety_normalized rule-based (0-1) ---
+    # Ogni arco riceve un punteggio basato su:
+    #   - Illuminazione (is_lit o lamp_count > 0): +0.40
+    #   - Densità lampioni (normalizzata): fino a +0.25
+    #   - Tipo di strada: fino a +0.20
+    #   - Prossimità trasporto pubblico: fino a +0.15
     densities = [G[u][v][k].get("lamp_density", 0) for u, v, k in G.edges(keys=True)]
     max_density = max(densities) if densities else 1
 
     for u, v, k in G.edges(keys=True):
-        density = G[u][v][k].get("lamp_density", 0)
-        # Normalizzare: 0 = massima insicurezza, 1 = massima sicurezza
-        G[u][v][k]["safety_normalized"] = density / max(max_density, 0.001)
+        data = G[u][v][k]
+        score = 0.0
+
+        # Illuminazione: componente dominante
+        is_lit = int(float(data.get("is_lit", 0)))
+        lamp_count = int(float(data.get("lamp_count", 0)))
+        if is_lit or lamp_count > 0:
+            score += 0.40
+
+        # Densità lampioni (normalizzata)
+        density = float(data.get("lamp_density", 0))
+        score += 0.25 * (density / max(max_density, 0.001))
+
+        # Tipo di strada
+        highway_type = data.get("highway", "unknown")
+        if isinstance(highway_type, list):
+            highway_type = highway_type[0]
+        hw = str(highway_type)
+        if hw in ("primary", "secondary", "trunk"):
+            score += 0.20
+        elif hw in ("tertiary", "residential", "living_street"):
+            score += 0.15
+        elif hw in ("pedestrian", "cycleway"):
+            score += 0.10
+        elif hw in ("footway", "path", "service", "track"):
+            score += 0.05
+
+        # Prossimità trasporto pubblico
+        has_bus = (
+            G.nodes[u].get("ha_fermata_bus", False)
+            or G.nodes[v].get("ha_fermata_bus", False)
+        )
+        has_bike = (
+            G.nodes[u].get("ha_bike_sharing", False)
+            or G.nodes[v].get("ha_bike_sharing", False)
+        )
+        if has_bus:
+            score += 0.10
+        if has_bike:
+            score += 0.05
+
+        data["safety_normalized"] = max(0.0, min(1.0, score))
+        data["safety_base"] = data["safety_normalized"]
 
     n_with_lamps = sum(1 for u, v, k in G.edges(keys=True) if G[u][v][k]["lamp_count"] > 0)
+    n_is_lit = sum(1 for u, v, k in G.edges(keys=True) if G[u][v][k]["is_lit"])
+    scores = [G[u][v][k]["safety_normalized"] for u, v, k in G.edges(keys=True)]
+    n_safe = sum(1 for s in scores if s >= 0.6)
+    n_medium = sum(1 for s in scores if 0.15 < s < 0.6)
+    n_danger = sum(1 for s in scores if s <= 0.15)
     print(f"   ✅ Archi con almeno 1 lampione: {n_with_lamps}/{G.number_of_edges()}")
+    print(f"   ✅ Archi illuminati (is_lit): {n_is_lit}/{G.number_of_edges()}")
+    print(f"   ✅ Distribuzione sicurezza:")
+    print(f"      🟢 Sicuro (≥0.75):  {n_safe}")
+    print(f"      🟠 Medio (0.25-0.75): {n_medium}")
+    print(f"      🔴 Pericolo (≤0.25): {n_danger}")
     return G
 
 
@@ -336,210 +552,481 @@ def enrich_graph_with_stops(G, fermate, bike):
             nearest = ox.nearest_nodes(G, lon, lat)
             G.nodes[nearest]["ha_bike_sharing"] = True
             G.nodes[nearest]["bici_disponibili"] = int(row["Numero Bici"])
+            G.nodes[nearest]["nome_stazione_bike"] = row["Denominazione"]
             bike_count += 1
         except Exception:
             pass
     print(f"   Stazioni bike sharing associate: {bike_count}")
+    return G
+
+
+def precompute_stop_nodes(G, fermate_df, bike_df):
+    """Pre-calcola ox.nearest_nodes per tutte le fermate bus e stazioni bike.
+    Ritorna (bus_nodes_list, bike_stations_list) pronti per il routing."""
+    print("🔧 Pre-calcolo nodi fermate e stazioni bike...")
+    bus_nodes = []
+    for _, row in fermate_df.iterrows():
+        try:
+            lat, lon = float(row["latitudine"]), float(row["longitudine"])
+            node = ox.nearest_nodes(G, lon, lat)
+            bus_nodes.append({
+                "node": node,
+                "id": row["idFermata"],
+                "nome": row["descrizioneFermata"],
+                "lat": lat,
+                "lon": lon,
+            })
+        except Exception:
+            pass
+    print(f"   Fermate bus pre-calcolate: {len(bus_nodes)}")
+
+    bike_stations = []
+    for _, row in bike_df.iterrows():
+        try:
+            lat, lon = float(row["Lat"]), float(row["Long"])
+            node = ox.nearest_nodes(G, lon, lat)
+            bike_stations.append({
+                "node": node,
+                "nome": row["Denominazione"],
+                "lat": lat,
+                "lon": lon,
+                "bici": int(row["Numero Bici"]),
+            })
+        except Exception:
+            pass
+    print(f"   Stazioni bike pre-calcolate: {len(bike_stations)}")
+    return bus_nodes, bike_stations
 
     return G
 
 
-# ===========================================================================
-# FASE 5: Calcolo Pesi e Routing Multi-Criterio
-# ===========================================================================
-def compute_edge_weight(data, ora, alpha=0.33, beta=0.33, gamma=0.34):
-    """
-    Calcola il peso combinato di un arco.
 
-    Parametri:
-        data:  attributi dell'arco
-        ora:   ora del giorno (0-23)
-        alpha: peso sicurezza (0-1)
-        beta:  peso carbon footprint (0-1)
-        gamma: peso tempo (0-1)
 
-    Ritorna un peso normalizzato (float ≥ 0).
+# ===========================================================================
+# FASE 4b: Bonus Notturno di Sicurezza
+# ===========================================================================
+def apply_night_bonus(G, ora):
     """
+    Tra le 19:00 e le 05:00, aumenta la sicurezza delle strade illuminate
+    e riduce quella delle strade al buio.
+    """
+    is_night = (ora >= 19 or ora <= 5)
+    for u, v, k in G.edges(keys=True):
+        data = G[u][v][k]
+        base = float(data.get("safety_base", data.get("safety_normalized", 0)))
+        if is_night:
+            is_lit = int(float(data.get("is_lit", 0)))
+            lamp_count = int(float(data.get("lamp_count", 0)))
+            if is_lit or lamp_count > 0:
+                data["safety_normalized"] = min(1.0, base + 0.15)
+            else:
+                data["safety_normalized"] = max(0.0, base - 0.10)
+        else:
+            data["safety_normalized"] = base
+
+
+# ===========================================================================
+# FASE 5: Routing Multi-Criterio (Bici + Bus)
+# ===========================================================================
+def _edge_weight_bike(data, ora):
+    """Peso per routing bici: privilegia sicurezza di notte, velocità di giorno."""
     length_km = data.get("length", 0) / 1000
+    tempo_min = (length_km / BIKE_SPEED_KMH) * 60
+    safety = float(data.get("safety_normalized", 0))
 
-    # --- TEMPO (minuti) ---
-    tempo_min = (length_km / WALKING_SPEED_KMH) * 60
+    # Bonus/malus per tipo strada
+    hw = str(data.get("highway", ""))
+    if isinstance(data.get("highway"), list):
+        hw = str(data["highway"][0])
+    hw_bonus = 0.0
+    if hw in ("cycleway",):
+        hw_bonus = -0.3   # preferisci ciclabili
+    elif hw in ("primary", "trunk", "motorway"):
+        hw_bonus = 0.5    # evita strade ad alto traffico
+    elif hw in ("residential", "living_street", "pedestrian"):
+        hw_bonus = -0.1
 
-    # --- CARBON FOOTPRINT ---
-    # A piedi = 0, ma se confrontiamo con l'auto, il "risparmio" è un beneficio
-    co2 = CO2_PIEDI_KG_PER_KM * length_km
-
-    # --- SICUREZZA ---
-    safety_norm = data.get("safety_normalized", 0.0)
-
-    # Di giorno (7-20), la sicurezza è quasi irrilevante
-    # Di notte, l'illuminazione conta molto
     if 7 <= ora <= 20:
-        insicurezza = 0.1 * (1 - safety_norm)
+        insicurezza = 0.2 * (1 - safety)
     else:
-        insicurezza = 1.0 * (1 - safety_norm)
+        insicurezza = 0.8 * (1 - safety)
 
-    # Normalizzare tempo e CO₂ su scala simile a insicurezza (0-1)
-    # Usiamo una lunghezza di riferimento (1 km) per normalizzare
-    tempo_normalizzato = min(tempo_min / 12.0, 1.0)  # 12 min = ~ 1 km a piedi
-    co2_normalizzato = co2  # Già ~0 per camminata
-
-    peso = (
-        alpha * insicurezza
-        + beta * co2_normalizzato
-        + gamma * tempo_normalizzato
-    )
-
-    # Garantire che il peso sia ≥ un minimo (per evitare peso 0)
+    tempo_norm = min(tempo_min / 12.0, 1.0)
+    peso = 0.4 * insicurezza + 0.6 * tempo_norm + hw_bonus * length_km
     return max(peso, 0.001)
 
 
-def find_route(G, origin_latlon, dest_latlon, ora=12, alpha=0.33, beta=0.33, gamma=0.34):
+def _path_length(G, path):
+    """Calcola la lunghezza totale in metri di un percorso (lista di nodi)."""
+    total = 0
+    for i in range(len(path) - 1):
+        u, v = path[i], path[i + 1]
+        ed = G[u][v][0] if 0 in G[u][v] else G[u][v][list(G[u][v].keys())[0]]
+        total += ed.get("length", 0)
+    return total
+
+
+def _geo_dist(lat1, lon1, lat2, lon2):
+    """Distanza euclidea approssimata tra due coordinate."""
+    return ((lat1 - lat2) ** 2 + (lon1 - lon2) ** 2) ** 0.5
+
+
+def find_bike_route(G, origin_latlon, dest_latlon, bike_df, ora=12,
+                    precomputed_bike=None):
     """
-    Trova il percorso ottimale tra due punti con pesi multi-criterio.
-
-    Parametri:
-        G:             grafo arricchito
-        origin_latlon: (latitudine, longitudine) partenza
-        dest_latlon:   (latitudine, longitudine) arrivo
-        ora:           ora del giorno (0-23)
-        alpha:         peso sicurezza
-        beta:          peso carbon footprint
-        gamma:         peso tempo
-
-    Ritorna: (lista_nodi, metriche)
+    Percorso bici con bike sharing: cammina alla stazione più vicina,
+    pedala fino alla stazione più vicina alla destinazione,
+    poi cammina fino a destinazione.
+    Ritorna (segments, metriche).
+    Se precomputed_bike è fornito, salta il calcolo ox.nearest_nodes.
     """
-    # Trovare nodi più vicini
-    orig_node = ox.nearest_nodes(G, origin_latlon[1], origin_latlon[0])
-    dest_node = ox.nearest_nodes(G, dest_latlon[1], dest_latlon[0])
+    orig = ox.nearest_nodes(G, origin_latlon[1], origin_latlon[0])
+    dest = ox.nearest_nodes(G, dest_latlon[1], dest_latlon[0])
 
-    print(f"🗺️  Routing da nodo {orig_node} a nodo {dest_node}")
-    print(f"   Ora: {ora}:00 | Pesi: sicurezza={alpha}, eco={beta}, tempo={gamma}")
+    if precomputed_bike is not None:
+        bike_stations = precomputed_bike
+    else:
+        bike_stations = []
+        for _, row in bike_df.iterrows():
+            try:
+                lat, lon = float(row["Lat"]), float(row["Long"])
+                node = ox.nearest_nodes(G, lon, lat)
+                bike_stations.append({
+                    "node": node,
+                    "nome": row["Denominazione"],
+                    "lat": lat,
+                    "lon": lon,
+                    "bici": int(row["Numero Bici"]),
+                })
+            except Exception:
+                pass
 
-    # Funzione peso custom
-    def weight_fn(u, v, data):
-        return compute_edge_weight(data, ora, alpha, beta, gamma)
-
-    # Dijkstra con peso custom
-    try:
-        route = nx.shortest_path(G, orig_node, dest_node, weight=weight_fn)
-    except nx.NetworkXNoPath:
-        print("   ❌ Nessun percorso trovato!")
+    if len(bike_stations) < 2:
+        print("   ❌ Stazioni bike sharing insufficienti!")
         return None, None
 
-    # Calcolare metriche del percorso
-    total_length_m = 0
-    total_lamps = 0
-    total_safety = 0
-    n_edges = 0
+    orig_lat, orig_lon = origin_latlon
+    dest_lat, dest_lon = dest_latlon
 
-    for i in range(len(route) - 1):
-        u, v = route[i], route[i + 1]
-        # Prendere il primo arco disponibile tra u e v
-        edge_data = G[u][v][0] if 0 in G[u][v] else G[u][v][list(G[u][v].keys())[0]]
-        total_length_m += edge_data.get("length", 0)
-        total_lamps += edge_data.get("lamp_count", 0)
-        total_safety += edge_data.get("safety_normalized", 0)
-        n_edges += 1
+    for s in bike_stations:
+        s["dist_orig"] = _geo_dist(s["lat"], s["lon"], orig_lat, orig_lon)
+        s["dist_dest"] = _geo_dist(s["lat"], s["lon"], dest_lat, dest_lon)
 
-    total_length_km = total_length_m / 1000
-    tempo_piedi_min = (total_length_km / WALKING_SPEED_KMH) * 60
-    tempo_bici_min = (total_length_km / BIKE_SPEED_KMH) * 60
-    co2_risparmiata = CO2_AUTO_KG_PER_KM * total_length_km
-    avg_safety = total_safety / max(n_edges, 1)
+    # Stazioni vicine all'origine CON bici disponibili
+    near_orig = [s for s in sorted(bike_stations, key=lambda s: s["dist_orig"])[:10]
+                 if s["bici"] > 0]
+    near_dest = sorted(bike_stations, key=lambda s: s["dist_dest"])[:10]
+
+    if not near_orig:
+        print("   ❌ Nessuna stazione con bici disponibili vicina alla partenza!")
+        return None, None
+
+    # Trovare la stazione più vicina all'origine (a piedi)
+    best_start = None
+    best_start_dist = float("inf")
+    for s in near_orig:
+        try:
+            d = nx.shortest_path_length(G, orig, s["node"], weight="length")
+            if d < best_start_dist:
+                best_start_dist = d
+                best_start = s
+        except nx.NetworkXNoPath:
+            pass
+
+    # Trovare la stazione più vicina alla destinazione (a piedi)
+    best_end = None
+    best_end_dist = float("inf")
+    for s in near_dest:
+        if best_start and s["node"] == best_start["node"]:
+            continue
+        try:
+            d = nx.shortest_path_length(G, s["node"], dest, weight="length")
+            if d < best_end_dist:
+                best_end_dist = d
+                best_end = s
+        except nx.NetworkXNoPath:
+            pass
+
+    if not best_start or not best_end:
+        print("   ❌ Impossibile trovare stazioni bike sharing raggiungibili!")
+        return None, None
+
+    # Segmento 1: Cammina → stazione partenza
+    try:
+        walk1 = nx.shortest_path(G, orig, best_start["node"], weight="length")
+    except nx.NetworkXNoPath:
+        walk1 = [orig]
+
+    # Segmento 2: Bici tra le due stazioni
+    def wfn(u, v, data):
+        return _edge_weight_bike(data, ora)
+    try:
+        bike_path = nx.shortest_path(G, best_start["node"],
+                                     best_end["node"], weight=wfn)
+    except nx.NetworkXNoPath:
+        print("   ❌ Nessun percorso bici trovato!")
+        return None, None
+
+    # Segmento 3: Cammina stazione arrivo → destinazione
+    try:
+        walk2 = nx.shortest_path(G, best_end["node"], dest, weight="length")
+    except nx.NetworkXNoPath:
+        walk2 = [best_end["node"]]
+
+    walk1_m = _path_length(G, walk1)
+    bike_m = _path_length(G, bike_path)
+    walk2_m = _path_length(G, walk2)
+    total_m = walk1_m + bike_m + walk2_m
+
+    walk_time = ((walk1_m + walk2_m) / 1000 / WALKING_SPEED_KMH) * 60
+    bike_time = (bike_m / 1000 / BIKE_SPEED_KMH) * 60
+
+    segments = [
+        {"type": "walk", "route": walk1,
+         "info": f"🚶 Cammina fino a: stazione {best_start['nome']} "
+                 f"({best_start['bici']} bici disponibili)"},
+        {"type": "bike", "route": bike_path,
+         "info": f"🚲 Bici: {best_start['nome']} → {best_end['nome']}"},
+        {"type": "walk", "route": walk2,
+         "info": f"🚶 Cammina fino a destinazione"},
+    ]
+
+    # Safety score medio
+    all_nodes = walk1 + bike_path[1:] + walk2[1:]
+    total_safety, n_e = 0.0, 0
+    for i in range(len(all_nodes) - 1):
+        u, v = all_nodes[i], all_nodes[i + 1]
+        ed = G[u][v][0] if 0 in G[u][v] else G[u][v][list(G[u][v].keys())[0]]
+        total_safety += float(ed.get("safety_normalized", 0))
+        n_e += 1
 
     metriche = {
-        "distanza_km": round(total_length_km, 2),
-        "tempo_piedi_min": round(tempo_piedi_min, 1),
-        "tempo_bici_min": round(tempo_bici_min, 1),
-        "lampioni_sul_percorso": total_lamps,
-        "safety_score_medio": round(avg_safety * 100, 1),  # percentuale
-        "co2_risparmiata_vs_auto_kg": round(co2_risparmiata, 3),
+        "distanza_km": round(total_m / 1000, 2),
+        "tempo_min": round(walk_time + bike_time, 1),
+        "safety_score": round((total_safety / max(n_e, 1)) * 100, 1),
+        "co2_kg": 0.0,
+        "mezzo": "🚲 Bici",
+        "stazione_partenza": best_start["nome"],
+        "stazione_arrivo": best_end["nome"],
+        "bici_disponibili": best_start["bici"],
+        "walk1_min": round((walk1_m / 1000 / WALKING_SPEED_KMH) * 60, 1),
+        "bike_min": round(bike_time, 1),
+        "walk2_min": round((walk2_m / 1000 / WALKING_SPEED_KMH) * 60, 1),
+    }
+    return segments, metriche
+
+
+def _find_lines_for_stop(lat, lon, osm_bus_stops, threshold=0.003):
+    """Trova le linee bus OSM vicine a una coordinata (entro threshold gradi).
+    Raccoglie le linee da TUTTE le fermate OSM nel raggio."""
+    all_lines = set()
+    for s in osm_bus_stops:
+        d = _geo_dist(s["lat"], s["lon"], lat, lon)
+        if d < threshold:
+            all_lines.update(s["lines"])
+    return sorted(all_lines)
+
+
+def find_bus_route(G, origin_latlon, dest_latlon, fermate_df,
+                   osm_bus_stops=None, ora=12, precomputed_bus=None):
+    """
+    Trova il percorso bus: cammina alla fermata più vicina all'origine,
+    prendi il bus fino alla fermata più vicina alla destinazione,
+    poi cammina fino a destinazione.
+    Usa osm_bus_stops per indicare quale linea prendere.
+    Se precomputed_bus è fornito, salta il calcolo ox.nearest_nodes.
+    Ritorna (segments, metriche).
+    """
+    orig = ox.nearest_nodes(G, origin_latlon[1], origin_latlon[0])
+    dest = ox.nearest_nodes(G, dest_latlon[1], dest_latlon[0])
+
+    if precomputed_bus is not None:
+        bus_nodes = precomputed_bus
+    else:
+        bus_nodes = []
+        for _, row in fermate_df.iterrows():
+            try:
+                lat, lon = float(row["latitudine"]), float(row["longitudine"])
+                node = ox.nearest_nodes(G, lon, lat)
+                bus_nodes.append({
+                    "node": node,
+                    "id": row["idFermata"],
+                    "nome": row["descrizioneFermata"],
+                    "lat": lat,
+                    "lon": lon,
+                })
+            except Exception:
+                pass
+
+    if len(bus_nodes) < 2:
+        print("   ❌ Fermate bus insufficienti!")
+        return None, None
+
+    orig_lat, orig_lon = origin_latlon
+    dest_lat, dest_lon = dest_latlon
+
+    for stop in bus_nodes:
+        stop["dist_orig"] = _geo_dist(stop["lat"], stop["lon"], orig_lat, orig_lon)
+        stop["dist_dest"] = _geo_dist(stop["lat"], stop["lon"], dest_lat, dest_lon)
+
+    near_orig = sorted(bus_nodes, key=lambda s: s["dist_orig"])[:15]
+    near_dest = sorted(bus_nodes, key=lambda s: s["dist_dest"])[:15]
+
+    # Fase A: Trovare la fermata più vicina all'origine (camminando)
+    best_start_stop = None
+    best_start_dist = float("inf")
+    for stop in near_orig:
+        try:
+            d = nx.shortest_path_length(G, orig, stop["node"], weight="length")
+            if d < best_start_dist:
+                best_start_dist = d
+                best_start_stop = stop
+        except nx.NetworkXNoPath:
+            pass
+
+    # Fase B: Trovare la fermata più vicina alla destinazione (camminando)
+    best_end_stop = None
+    best_end_dist = float("inf")
+    for stop in near_dest:
+        if best_start_stop and stop["node"] == best_start_stop["node"]:
+            continue
+        try:
+            d = nx.shortest_path_length(G, stop["node"], dest, weight="length")
+            if d < best_end_dist:
+                best_end_dist = d
+                best_end_stop = stop
+        except nx.NetworkXNoPath:
+            pass
+
+    if not best_start_stop or not best_end_stop:
+        print("   ❌ Impossibile trovare fermate raggiungibili!")
+        return None, None
+
+    # --- Identificare le linee bus ---
+    bus_line_str = ""
+    if osm_bus_stops:
+        lines_start = _find_lines_for_stop(
+            best_start_stop["lat"], best_start_stop["lon"], osm_bus_stops)
+        lines_end = _find_lines_for_stop(
+            best_end_stop["lat"], best_end_stop["lon"], osm_bus_stops)
+        common = sorted(set(lines_start) & set(lines_end))
+        if common:
+            bus_line_str = f"Linea {', '.join(common)}"
+        elif lines_start:
+            bus_line_str = f"Linee disponibili: {', '.join(sorted(lines_start[:5]))}"
+
+    # Segmento 1: Cammina → fermata partenza
+    try:
+        walk1 = nx.shortest_path(G, orig, best_start_stop["node"], weight="length")
+    except nx.NetworkXNoPath:
+        walk1 = [orig]
+
+    # Segmento 2: Bus tra le due fermate
+    try:
+        bus_path = nx.shortest_path(G, best_start_stop["node"],
+                                    best_end_stop["node"], weight="length")
+    except nx.NetworkXNoPath:
+        print("   ❌ Nessun percorso bus trovato!")
+        return None, None
+
+    # Segmento 3: Cammina fermata arrivo → destinazione
+    try:
+        walk2 = nx.shortest_path(G, best_end_stop["node"], dest, weight="length")
+    except nx.NetworkXNoPath:
+        walk2 = [best_end_stop["node"]]
+
+    walk1_m = _path_length(G, walk1)
+    bus_m = _path_length(G, bus_path)
+    walk2_m = _path_length(G, walk2)
+    total_m = walk1_m + bus_m + walk2_m
+
+    walk_time = ((walk1_m + walk2_m) / 1000 / WALKING_SPEED_KMH) * 60
+    bus_time = (bus_m / 1000 / BUS_SPEED_KMH) * 60
+    total_time = walk_time + bus_time
+
+    co2 = CO2_BUS_KG_PER_KM_PASSEGGERO * (bus_m / 1000)
+
+    bus_label = f"🚌 {bus_line_str}: " if bus_line_str else "🚌 Bus: "
+    segments = [
+        {"type": "walk", "route": walk1,
+         "info": f"🚶 Cammina fino a: {best_start_stop['nome']}"},
+        {"type": "bus", "route": bus_path,
+         "info": f"{bus_label}{best_start_stop['nome']} → {best_end_stop['nome']}"},
+        {"type": "walk", "route": walk2,
+         "info": f"🚶 Cammina fino a destinazione"},
+    ]
+
+    metriche = {
+        "distanza_km": round(total_m / 1000, 2),
+        "tempo_min": round(total_time, 1),
+        "safety_score": 0.0,
+        "co2_kg": round(co2, 3),
+        "mezzo": "🚌 Bus",
+        "fermata_partenza": best_start_stop["nome"],
+        "fermata_arrivo": best_end_stop["nome"],
+        "linea_bus": bus_line_str,
+        "walk1_min": round((walk1_m / 1000 / WALKING_SPEED_KMH) * 60, 1),
+        "bus_min": round(bus_time, 1),
+        "walk2_min": round((walk2_m / 1000 / WALKING_SPEED_KMH) * 60, 1),
     }
 
-    print(f"   ✅ Percorso trovato!")
-    print(f"      Distanza: {metriche['distanza_km']} km")
-    print(f"      Tempo a piedi: {metriche['tempo_piedi_min']} min")
-    print(f"      Tempo in bici: {metriche['tempo_bici_min']} min")
-    print(f"      Lampioni: {metriche['lampioni_sul_percorso']}")
-    print(f"      Safety score: {metriche['safety_score_medio']}%")
-    print(f"      CO₂ risparmiata vs auto: {metriche['co2_risparmiata_vs_auto_kg']} kg")
+    # Safety score medio su tutto il percorso
+    all_nodes = walk1 + bus_path[1:] + walk2[1:]
+    total_safety, n_e = 0.0, 0
+    for i in range(len(all_nodes) - 1):
+        u, v = all_nodes[i], all_nodes[i + 1]
+        ed = G[u][v][0] if 0 in G[u][v] else G[u][v][list(G[u][v].keys())[0]]
+        total_safety += float(ed.get("safety_normalized", 0))
+        n_e += 1
+    metriche["safety_score"] = round((total_safety / max(n_e, 1)) * 100, 1)
 
-    return route, metriche
+    return segments, metriche
 
 
 # ===========================================================================
 # FASE 6: Visualizzazione con Folium
 # ===========================================================================
-def visualize_route(G, route, lamps, metriche, filename="safewalk_map.html"):
+def _safety_color(safety_norm):
+    """>=0.75 verde (sicuro), <=0.25 rosso (pericolo), resto arancione."""
+    if safety_norm >= 0.6:
+        return "green"
+    elif safety_norm > 0.15:
+        return "orange"
+    else:
+        return "red"
+
+
+def _path_coords(G, route):
+    """Estrae le coordinate (lat, lon) da una lista di nodi."""
+    coords = []
+    for i in range(len(route) - 1):
+        u, v = route[i], route[i + 1]
+        ed = G[u][v][0] if 0 in G[u][v] else G[u][v][list(G[u][v].keys())[0]]
+        if "geometry" in ed:
+            seg = [(lat, lon) for lon, lat in ed["geometry"].coords]
+        else:
+            seg = [
+                (float(G.nodes[u]["y"]), float(G.nodes[u]["x"])),
+                (float(G.nodes[v]["y"]), float(G.nodes[v]["x"])),
+            ]
+        if coords and coords[-1] == seg[0]:
+            coords.extend(seg[1:])
+        else:
+            coords.extend(seg)
+    if not coords and route:
+        coords = [(float(G.nodes[route[0]]["y"]), float(G.nodes[route[0]]["x"]))]
+    return coords
+
+
+def visualize_map(G, bike_segments, bike_metriche, bus_segments, bus_metriche,
+                  fermate_df=None, bike_df=None, filename="safewalk_map.html"):
     """
-    Crea una mappa HTML interattiva con il percorso e i lampioni.
-    """
-    try:
-        import folium
-    except ImportError:
-        print("   ⚠️ folium non installato. Installa con: pip install folium")
-        return
-
-    print(f"🗺️  Generazione mappa interattiva...")
-
-    # Centro della mappa
-    center_lat = np.mean([G.nodes[n]["y"] for n in route])
-    center_lon = np.mean([G.nodes[n]["x"] for n in route])
-    m = folium.Map(location=[center_lat, center_lon], zoom_start=15)
-
-    # Disegnare il percorso
-    route_coords = [(G.nodes[n]["y"], G.nodes[n]["x"]) for n in route]
-    folium.PolyLine(
-        route_coords,
-        color="blue",
-        weight=5,
-        opacity=0.8,
-        popup=f"Distanza: {metriche['distanza_km']} km<br>"
-              f"Tempo: {metriche['tempo_piedi_min']} min<br>"
-              f"Safety: {metriche['safety_score_medio']}%",
-    ).add_to(m)
-
-    # Marker partenza e arrivo
-    folium.Marker(
-        route_coords[0],
-        popup="🟢 Partenza",
-        icon=folium.Icon(color="green", icon="play"),
-    ).add_to(m)
-    folium.Marker(
-        route_coords[-1],
-        popup="🔴 Arrivo",
-        icon=folium.Icon(color="red", icon="stop"),
-    ).add_to(m)
-
-    # Lampioni come cerchi gialli
-    lamp_group = folium.FeatureGroup(name="Lampioni")
-    for lamp in lamps:
-        folium.CircleMarker(
-            [lamp["lat"], lamp["lon"]],
-            radius=3,
-            color="orange",
-            fill=True,
-            fill_color="yellow",
-            fill_opacity=0.7,
-            popup="💡 Lampione",
-        ).add_to(lamp_group)
-    lamp_group.add_to(m)
-
-    # Layer control
-    folium.LayerControl().add_to(m)
-
-    # Salvare
-    output_path = OUTPUT_DIR / filename
-    m.save(str(output_path))
-    print(f"   ✅ Mappa salvata in: {output_path}")
-    return m
-
-
-def visualize_comparison(G, routes_dict, lamps, filename="safewalk_comparison.html"):
-    """
-    Confronta più percorsi su una singola mappa.
-    routes_dict: { "nome": (route, metriche, colore) }
+    Genera un'unica mappa HTML con:
+      - Tutti gli archi colorati per sicurezza (verde/arancione/rosso)
+      - Percorso bici in viola (camminate tratteggiate, bici pieno)
+      - Percorso bus in blu (camminate tratteggiate, bus pieno)
+      - Pallini blu = fermate bus, pallini gialli = stazioni bike sharing
+      - Marker partenza, arrivo, fermate bus usate, stazioni bike usate
     """
     try:
         import folium
@@ -547,48 +1034,230 @@ def visualize_comparison(G, routes_dict, lamps, filename="safewalk_comparison.ht
         print("   ⚠️ folium non installato.")
         return
 
-    print(f"🗺️  Generazione mappa comparativa...")
+    print("🗺️  Generazione mappa interattiva...")
 
-    # Centro basato sul primo percorso
-    first_route = list(routes_dict.values())[0][0]
-    center_lat = np.mean([G.nodes[n]["y"] for n in first_route])
-    center_lon = np.mean([G.nodes[n]["x"] for n in first_route])
-    m = folium.Map(location=[center_lat, center_lon], zoom_start=15)
+    # Centro mappa
+    center_lat, center_lon = 41.117, 16.87
+    if bike_segments:
+        all_route = bike_segments[0]["route"]
+        for seg in bike_segments[1:]:
+            all_route = all_route + seg["route"][1:]
+        if all_route:
+            center_lat = np.mean([float(G.nodes[n]["y"]) for n in all_route])
+            center_lon = np.mean([float(G.nodes[n]["x"]) for n in all_route])
+    m = folium.Map(location=[center_lat, center_lon], zoom_start=14,
+                   tiles="cartodbpositron")
 
-    colors = ["blue", "red", "green", "purple", "orange"]
+    # --- Layer: sicurezza strade ---
+    safety_grp = folium.FeatureGroup(name="Sicurezza strade", show=True)
+    for u, v, k, data in G.edges(data=True, keys=True):
+        safety = float(data.get("safety_normalized", 0))
+        color = _safety_color(safety)
+        if "geometry" in data:
+            coords = [(lat, lon) for lon, lat in data["geometry"].coords]
+        else:
+            coords = [
+                (float(G.nodes[u]["y"]), float(G.nodes[u]["x"])),
+                (float(G.nodes[v]["y"]), float(G.nodes[v]["x"])),
+            ]
+        folium.PolyLine(coords, color=color, weight=2, opacity=0.5).add_to(safety_grp)
+    safety_grp.add_to(m)
 
-    for i, (nome, (route, metriche, colore)) in enumerate(routes_dict.items()):
-        if route is None:
-            continue
-        color = colore if colore else colors[i % len(colors)]
-        coords = [(G.nodes[n]["y"], G.nodes[n]["x"]) for n in route]
+    # --- Layer: Fermate bus (pallini blu) ---
+    if fermate_df is not None:
+        bus_stop_grp = folium.FeatureGroup(name="🚏 Fermate Bus", show=True)
+        for _, row in fermate_df.iterrows():
+            try:
+                lat = float(row["latitudine"])
+                lon = float(row["longitudine"])
+                folium.CircleMarker(
+                    location=[lat, lon],
+                    radius=4,
+                    color="blue",
+                    fill=True,
+                    fill_color="blue",
+                    fill_opacity=0.7,
+                    popup=f"🚏 {row['descrizioneFermata']}",
+                ).add_to(bus_stop_grp)
+            except Exception:
+                pass
+        bus_stop_grp.add_to(m)
 
-        folium.PolyLine(
-            coords,
-            color=color,
-            weight=4,
-            opacity=0.7,
-            popup=(
-                f"<b>{nome}</b><br>"
-                f"Distanza: {metriche['distanza_km']} km<br>"
-                f"Tempo: {metriche['tempo_piedi_min']} min<br>"
-                f"Safety: {metriche['safety_score_medio']}%<br>"
-                f"CO₂ risparmiata: {metriche['co2_risparmiata_vs_auto_kg']} kg"
-            ),
+    # --- Layer: Stazioni bike sharing (pallini gialli) ---
+    if bike_df is not None:
+        bike_st_grp = folium.FeatureGroup(name="🚲 Stazioni Bike Sharing", show=True)
+        for _, row in bike_df.iterrows():
+            try:
+                lat = float(row["Lat"])
+                lon = float(row["Long"])
+                folium.CircleMarker(
+                    location=[lat, lon],
+                    radius=6,
+                    color="goldenrod",
+                    fill=True,
+                    fill_color="yellow",
+                    fill_opacity=0.9,
+                    popup=(f"🚲 <b>{row['Denominazione']}</b><br>"
+                           f"Bici: {row['Numero Bici']}"),
+                ).add_to(bike_st_grp)
+            except Exception:
+                pass
+        bike_st_grp.add_to(m)
+
+    # --- Layer: Percorso bici (viola) ---
+    if bike_segments and bike_metriche:
+        bike_grp = folium.FeatureGroup(name="🚲 Percorso Bici", show=True)
+        seg_colors_bike = {"walk": "darkmagenta", "bike": "purple"}
+        seg_dash_bike = {"walk": "5 10", "bike": None}
+        seg_weight_bike = {"walk": 4, "bike": 6}
+
+        for seg in bike_segments:
+            sc = _path_coords(G, seg["route"])
+            if len(sc) < 2:
+                continue
+            line_opts = {
+                "color": seg_colors_bike[seg["type"]],
+                "weight": seg_weight_bike[seg["type"]],
+                "opacity": 0.85,
+                "popup": seg["info"],
+            }
+            if seg_dash_bike[seg["type"]]:
+                line_opts["dash_array"] = seg_dash_bike[seg["type"]]
+            folium.PolyLine(sc, **line_opts).add_to(bike_grp)
+
+        # Marker stazioni bike usate
+        if len(bike_segments) >= 2:
+            # Stazione partenza bici (fine segmento walk1)
+            if len(bike_segments[0]["route"]) > 1:
+                sc0 = _path_coords(G, bike_segments[0]["route"])
+                folium.Marker(
+                    sc0[-1],
+                    popup=f"🚲 Stazione: {bike_metriche.get('stazione_partenza', '')}",
+                    icon=folium.Icon(color="purple", icon="bicycle", prefix="fa"),
+                ).add_to(bike_grp)
+            # Stazione arrivo bici (fine segmento bike)
+            if len(bike_segments) > 1 and len(bike_segments[1]["route"]) > 1:
+                sc1 = _path_coords(G, bike_segments[1]["route"])
+                folium.Marker(
+                    sc1[-1],
+                    popup=f"🚲 Stazione: {bike_metriche.get('stazione_arrivo', '')}",
+                    icon=folium.Icon(color="purple", icon="bicycle", prefix="fa"),
+                ).add_to(bike_grp)
+        bike_grp.add_to(m)
+
+    # --- Layer: Percorso bus (blu) ---
+    if bus_segments and bus_metriche:
+        bus_grp = folium.FeatureGroup(name="🚌 Percorso Bus", show=True)
+        seg_colors = {"walk": "darkblue", "bus": "blue"}
+        seg_dash = {"walk": "5 10", "bus": None}
+        seg_weight = {"walk": 4, "bus": 6}
+
+        for seg in bus_segments:
+            sc = _path_coords(G, seg["route"])
+            if len(sc) < 2:
+                continue
+            line_opts = {
+                "color": seg_colors[seg["type"]],
+                "weight": seg_weight[seg["type"]],
+                "opacity": 0.85,
+                "popup": seg["info"],
+            }
+            if seg_dash[seg["type"]]:
+                line_opts["dash_array"] = seg_dash[seg["type"]]
+            folium.PolyLine(sc, **line_opts).add_to(bus_grp)
+
+        # Marker fermate bus usate
+        if len(bus_segments[0]["route"]) > 1:
+            sc0 = _path_coords(G, bus_segments[0]["route"])
+            folium.Marker(
+                sc0[-1],
+                popup=(f"🚏 Fermata: {bus_metriche.get('fermata_partenza', '')}"
+                       f"<br>{bus_metriche.get('linea_bus', '')}"),
+                icon=folium.Icon(color="blue", icon="bus", prefix="fa"),
+            ).add_to(bus_grp)
+        if len(bus_segments) > 1 and len(bus_segments[1]["route"]) > 1:
+            sc1 = _path_coords(G, bus_segments[1]["route"])
+            folium.Marker(
+                sc1[-1],
+                popup=(f"🚏 Fermata: {bus_metriche.get('fermata_arrivo', '')}"
+                       f"<br>{bus_metriche.get('linea_bus', '')}"),
+                icon=folium.Icon(color="blue", icon="bus", prefix="fa"),
+            ).add_to(bus_grp)
+        bus_grp.add_to(m)
+
+    # --- Marker partenza e arrivo ---
+    first_route = None
+    if bike_segments:
+        first_route = bike_segments[0]["route"]
+        last_route = bike_segments[-1]["route"]
+    elif bus_segments:
+        first_route = bus_segments[0]["route"]
+        last_route = bus_segments[-1]["route"]
+
+    if first_route:
+        folium.Marker(
+            (float(G.nodes[first_route[0]]["y"]),
+             float(G.nodes[first_route[0]]["x"])),
+            popup="🟢 Partenza",
+            icon=folium.Icon(color="green", icon="play"),
+        ).add_to(m)
+        folium.Marker(
+            (float(G.nodes[last_route[-1]]["y"]),
+             float(G.nodes[last_route[-1]]["x"])),
+            popup="🔴 Arrivo",
+            icon=folium.Icon(color="red", icon="stop"),
         ).add_to(m)
 
-    # Lampioni
-    lamp_group = folium.FeatureGroup(name="Lampioni")
-    for lamp in lamps:
-        folium.CircleMarker(
-            [lamp["lat"], lamp["lon"]],
-            radius=2,
-            color="orange",
-            fill=True,
-            fill_color="yellow",
-            fill_opacity=0.6,
-        ).add_to(lamp_group)
-    lamp_group.add_to(m)
+    # --- Legenda ---
+    legend_html = """
+    <div style="position:fixed; bottom:30px; left:30px; z-index:1000;
+                background:white; padding:12px 16px; border-radius:8px;
+                border:2px solid grey; font-size:13px; line-height:1.8;">
+        <b>Legenda</b><br>
+        <span style="color:green;">&#9644;</span> Sicuro (&ge;75%)<br>
+        <span style="color:orange;">&#9644;</span> Media (25-75%)<br>
+        <span style="color:red;">&#9644;</span> Pericolo (&le;25%)<br>
+        <span style="color:purple;">&#9644;&#9644;</span> 🚲 Percorso Bici<br>
+        <span style="color:blue;">&#9644;&#9644;</span> 🚌 Percorso Bus<br>
+        <span style="color:darkblue;">- - -</span> 🚶 Camminata<br>
+        <span style="color:blue;">&#9679;</span> Fermata bus &nbsp;
+        <span style="color:goldenrod;">&#9679;</span> Stazione bike
+    </div>
+    """
+    m.get_root().html.add_child(folium.Element(legend_html))
+
+    # --- Info box con riepilogo ---
+    info_parts = []
+    if bike_metriche:
+        staz = (f"<br>📍 {bike_metriche.get('stazione_partenza', '')} → "
+                f"{bike_metriche.get('stazione_arrivo', '')}" if "stazione_partenza" in bike_metriche else "")
+        info_parts.append(
+            f"<b>🚲 Bici</b>: {bike_metriche['distanza_km']} km, "
+            f"{bike_metriche['tempo_min']} min "
+            f"(🚶 {bike_metriche.get('walk1_min', 0)}+"
+            f"{bike_metriche.get('walk2_min', 0)} min), "
+            f"Safety {bike_metriche['safety_score']}%{staz}"
+        )
+    if bus_metriche:
+        linea = bus_metriche.get("linea_bus", "")
+        linea_str = f"<br>🚌 {linea}" if linea else ""
+        info_parts.append(
+            f"<b>🚌 Bus</b>: {bus_metriche['distanza_km']} km, "
+            f"{bus_metriche['tempo_min']} min "
+            f"(🚶 {bus_metriche['walk1_min']}+{bus_metriche['walk2_min']} min), "
+            f"Safety {bus_metriche['safety_score']}%, "
+            f"CO₂ {bus_metriche['co2_kg']} kg{linea_str}"
+        )
+    if info_parts:
+        info_html = f"""
+        <div style="position:fixed; top:15px; left:60px; z-index:1000;
+                    background:white; padding:12px 16px; border-radius:8px;
+                    border:2px solid grey; font-size:13px; line-height:1.8;
+                    max-width:520px;">
+            <b>Riepilogo Percorsi</b><br>{'<br>'.join(info_parts)}
+        </div>
+        """
+        m.get_root().html.add_child(folium.Element(info_html))
 
     folium.LayerControl().add_to(m)
 
@@ -598,99 +1267,128 @@ def visualize_comparison(G, routes_dict, lamps, filename="safewalk_comparison.ht
     return m
 
 
-# ===========================================================================
-# FASE 7 (BONUS): Modello ML per Safety Score
-# ===========================================================================
-def train_safety_model(G):
-    """
-    Addestra un modello di regressione per predire il safety score
-    di un arco in base alle sue features.
+def visualize_map_light(G, bike_segments, bike_metriche, bus_segments,
+                        bus_metriche, filename="route_map.html"):
+    """Versione leggera della mappa: disegna SOLO i percorsi calcolati,
+    senza il layer sicurezza (51K archi) né tutte le fermate. Molto più veloce."""
+    import folium
 
-    NOTA: il target è sintetico (basato su regole), poiché non abbiamo
-    dati reali di criminalità/incidenti.
-    """
+    center_lat, center_lon = 41.117, 16.87
+    all_nodes = []
+    for segs in [bike_segments, bus_segments]:
+        if segs:
+            for seg in segs:
+                all_nodes.extend(seg["route"])
+    if all_nodes:
+        center_lat = np.mean([float(G.nodes[n]["y"]) for n in all_nodes])
+        center_lon = np.mean([float(G.nodes[n]["x"]) for n in all_nodes])
+
+    m = folium.Map(location=[center_lat, center_lon], zoom_start=15,
+                   tiles="cartodbpositron")
+
+    # --- Percorso bici ---
+    if bike_segments and bike_metriche:
+        bike_grp = folium.FeatureGroup(name="🚲 Percorso Bici", show=True)
+        styles = {
+            "walk": {"color": "darkmagenta", "weight": 4, "dash_array": "5 10"},
+            "bike": {"color": "purple", "weight": 6},
+        }
+        for seg in bike_segments:
+            sc = _path_coords(G, seg["route"])
+            if len(sc) < 2:
+                continue
+            opts = {"opacity": 0.85, "popup": seg["info"],
+                    **styles[seg["type"]]}
+            folium.PolyLine(sc, **opts).add_to(bike_grp)
+
+        # Marker stazioni
+        if len(bike_segments) >= 2 and len(bike_segments[0]["route"]) > 1:
+            sc0 = _path_coords(G, bike_segments[0]["route"])
+            folium.Marker(
+                sc0[-1],
+                popup=f"🚲 {bike_metriche.get('stazione_partenza', '')}",
+                icon=folium.Icon(color="purple", icon="bicycle", prefix="fa"),
+            ).add_to(bike_grp)
+        if len(bike_segments) > 1 and len(bike_segments[1]["route"]) > 1:
+            sc1 = _path_coords(G, bike_segments[1]["route"])
+            folium.Marker(
+                sc1[-1],
+                popup=f"🚲 {bike_metriche.get('stazione_arrivo', '')}",
+                icon=folium.Icon(color="purple", icon="bicycle", prefix="fa"),
+            ).add_to(bike_grp)
+        bike_grp.add_to(m)
+
+    # --- Percorso bus ---
+    if bus_segments and bus_metriche:
+        bus_grp = folium.FeatureGroup(name="🚌 Percorso Bus", show=True)
+        styles = {
+            "walk": {"color": "darkblue", "weight": 4, "dash_array": "5 10"},
+            "bus": {"color": "blue", "weight": 6},
+        }
+        for seg in bus_segments:
+            sc = _path_coords(G, seg["route"])
+            if len(sc) < 2:
+                continue
+            opts = {"opacity": 0.85, "popup": seg["info"],
+                    **styles[seg["type"]]}
+            folium.PolyLine(sc, **opts).add_to(bus_grp)
+
+        if len(bus_segments[0]["route"]) > 1:
+            sc0 = _path_coords(G, bus_segments[0]["route"])
+            folium.Marker(
+                sc0[-1],
+                popup=(f"🚏 {bus_metriche.get('fermata_partenza', '')}"
+                       f"<br>{bus_metriche.get('linea_bus', '')}"),
+                icon=folium.Icon(color="blue", icon="bus", prefix="fa"),
+            ).add_to(bus_grp)
+        if len(bus_segments) > 1 and len(bus_segments[1]["route"]) > 1:
+            sc1 = _path_coords(G, bus_segments[1]["route"])
+            folium.Marker(
+                sc1[-1],
+                popup=(f"🚏 {bus_metriche.get('fermata_arrivo', '')}"
+                       f"<br>{bus_metriche.get('linea_bus', '')}"),
+                icon=folium.Icon(color="blue", icon="bus", prefix="fa"),
+            ).add_to(bus_grp)
+        bus_grp.add_to(m)
+
+    # --- Marker partenza e arrivo ---
+    first_route = None
+    if bike_segments:
+        first_route = bike_segments[0]["route"]
+        last_route = bike_segments[-1]["route"]
+    elif bus_segments:
+        first_route = bus_segments[0]["route"]
+        last_route = bus_segments[-1]["route"]
+    if first_route:
+        folium.Marker(
+            (float(G.nodes[first_route[0]]["y"]),
+             float(G.nodes[first_route[0]]["x"])),
+            popup="🟢 Partenza",
+            icon=folium.Icon(color="green", icon="play"),
+        ).add_to(m)
+        folium.Marker(
+            (float(G.nodes[last_route[-1]]["y"]),
+             float(G.nodes[last_route[-1]]["x"])),
+            popup="🔴 Arrivo",
+            icon=folium.Icon(color="red", icon="stop"),
+        ).add_to(m)
+
+    folium.LayerControl().add_to(m)
+    output_path = OUTPUT_DIR / filename
+    m.save(str(output_path))
+    return m
+def geocode_place(query):
+    """Geocodifica un luogo usando osmnx (Nominatim). Ritorna (lat, lon)."""
     try:
-        from sklearn.ensemble import GradientBoostingRegressor
-        from sklearn.model_selection import train_test_split
-        from sklearn.metrics import mean_absolute_error, r2_score
-    except ImportError:
-        print("   ⚠️ scikit-learn non installato.")
+        result = ox.geocode(query + ", Bari, Italy")
+        return result  # (lat, lon)
+    except Exception:
         return None
 
-    print("🤖 Addestramento modello ML per safety score...")
 
-    # Preparare dataset
-    rows = []
-    for u, v, k, data in G.edges(data=True, keys=True):
-        length = data.get("length", 0)
-        lamp_density = data.get("lamp_density", 0)
-        lamp_count = data.get("lamp_count", 0)
-        highway_type = data.get("highway", "unknown")
-
-        # Highway type encoding (semplice)
-        highway_score = 0.5
-        if isinstance(highway_type, str):
-            if highway_type in ("primary", "secondary", "trunk"):
-                highway_score = 0.8
-            elif highway_type in ("tertiary", "residential"):
-                highway_score = 0.6
-            elif highway_type in ("footway", "path", "service"):
-                highway_score = 0.3
-
-        # Simulare diverse ore del giorno
-        for ora in range(24):
-            # Target sintetico
-            safety = 50.0  # base
-            safety += min(lamp_density * 2, 30)  # max +30 per illuminazione
-            if highway_type in ("primary", "secondary"):
-                safety += 10
-            if not (7 <= ora <= 20):
-                safety -= 25  # penalità notturna
-            else:
-                safety += 10  # bonus diurno
-            safety = max(0, min(100, safety))
-
-            rows.append({
-                "length": length,
-                "lamp_density": lamp_density,
-                "lamp_count": lamp_count,
-                "highway_score": highway_score,
-                "ora": ora,
-                "is_notte": int(not (7 <= ora <= 20)),
-                "safety_target": safety,
-            })
-
-    df = pd.DataFrame(rows)
-
-    features = ["length", "lamp_density", "lamp_count", "highway_score", "ora", "is_notte"]
-    X = df[features]
-    y = df["safety_target"]
-
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-
-    model = GradientBoostingRegressor(n_estimators=100, max_depth=4, random_state=42)
-    model.fit(X_train, y_train)
-
-    y_pred = model.predict(X_test)
-    mae = mean_absolute_error(y_test, y_pred)
-    r2 = r2_score(y_test, y_pred)
-
-    print(f"   ✅ Modello addestrato!")
-    print(f"      MAE: {mae:.2f}")
-    print(f"      R²:  {r2:.4f}")
-    print(f"      Feature importances:")
-    for feat, imp in sorted(zip(features, model.feature_importances_), key=lambda x: -x[1]):
-        print(f"         {feat}: {imp:.3f}")
-
-    return model
-
-
-# ===========================================================================
-# MAIN: Esecuzione Pipeline
-# ===========================================================================
 def main():
     print("=" * 60)
-    print("  SafeWalk Pipeline — Multi-Criteria Routing per Bari")
+    print("  SafeWalk — Routing Sicuro e Sostenibile per Bari")
     print("=" * 60)
     print()
 
@@ -698,9 +1396,11 @@ def main():
     G = build_walking_graph(use_cache=True)
     print()
 
-    # --- FASE 2: Lampioni ---
+    # --- FASE 2: Lampioni, strade illuminate, linee bus ---
     lamps = fetch_street_lamps(use_cache=True)
     lamp_gdf = lamps_to_geodataframe(lamps)
+    lit_way_ids = fetch_lit_ways(use_cache=True)
+    osm_bus_stops, line_info = fetch_bus_routes(use_cache=True)
     print()
 
     # --- FASE 3: Dati CSV ---
@@ -710,78 +1410,102 @@ def main():
     print()
 
     # --- FASE 4: Arricchire grafo ---
-    G = enrich_graph_with_lamps(G, lamp_gdf)
     G = enrich_graph_with_stops(G, fermate, bike)
+    G = enrich_graph_with_lamps(G, lamp_gdf, lit_way_ids)
+    print()
+
+    # --- INPUT UTENTE ---
+    print("=" * 60)
+    print("  Inserisci i dati del percorso")
+    print("=" * 60)
+
+    origin_str = input("📍 Luogo di partenza: ").strip()
+    dest_str = input("📍 Luogo di destinazione: ").strip()
+    ora_str = input("🕐 Orario (0-23): ").strip()
+
+    # Default di fallback
+    if not origin_str:
+        origin_str = "Politecnico di Bari"
+    if not dest_str:
+        dest_str = "Stazione Centrale Bari"
+    ora = int(ora_str) if ora_str.isdigit() and 0 <= int(ora_str) <= 23 else 12
+
+    print(f"\n   Partenza:     {origin_str}")
+    print(f"   Destinazione: {dest_str}")
+    print(f"   Orario:       {ora}:00")
+    print()
+
+    # Geocodifica
+    origin = geocode_place(origin_str)
+    dest = geocode_place(dest_str)
+
+    if not origin:
+        print(f"   ❌ Impossibile geolocalizzare: {origin_str}")
+        return
+    if not dest:
+        print(f"   ❌ Impossibile geolocalizzare: {dest_str}")
+        return
+
+    print(f"   📌 Partenza:     ({origin[0]:.5f}, {origin[1]:.5f})")
+    print(f"   📌 Destinazione: ({dest[0]:.5f}, {dest[1]:.5f})")
     print()
 
     # --- FASE 5: Routing ---
-    # ESEMPIO: dal Politecnico di Bari alla Stazione Centrale
-    origin = (41.1087, 16.8785)   # Politecnico di Bari (approssimativo)
-    dest = (41.1173, 16.8693)     # Stazione Centrale Bari (approssimativo)
-
     print("=" * 60)
-    print("  SCENARIO: Politecnico → Stazione Centrale (ore 22:00)")
+    print("  🚲 PERCORSO BICI (sostenibile)")
     print("=" * 60)
-
-    # Percorso bilanciato
-    route_balanced, metriche_balanced = find_route(
-        G, origin, dest, ora=22, alpha=0.33, beta=0.33, gamma=0.34
-    )
+    bike_segments, bike_metriche = find_bike_route(G, origin, dest, bike, ora)
+    if bike_metriche:
+        print(f"   🚶 Cammina fino a: stazione {bike_metriche['stazione_partenza']} "
+              f"({bike_metriche['walk1_min']} min)")
+        print(f"   🚲 Pedala fino a:  stazione {bike_metriche['stazione_arrivo']} "
+              f"({bike_metriche['bike_min']} min)")
+        print(f"   🚶 Cammina fino a destinazione ({bike_metriche['walk2_min']} min)")
+        print(f"   Distanza: {bike_metriche['distanza_km']} km")
+        print(f"   Tempo:    {bike_metriche['tempo_min']} min")
+        print(f"   Safety:   {bike_metriche['safety_score']}%")
+        print(f"   CO₂:      {bike_metriche['co2_kg']} kg")
     print()
 
-    # Percorso più sicuro
-    route_safe, metriche_safe = find_route(
-        G, origin, dest, ora=22, alpha=0.8, beta=0.0, gamma=0.2
-    )
-    print()
-
-    # Percorso più veloce
-    route_fast, metriche_fast = find_route(
-        G, origin, dest, ora=22, alpha=0.0, beta=0.0, gamma=1.0
-    )
+    print("=" * 60)
+    print("  🚌 PERCORSO BUS")
+    print("=" * 60)
+    bus_segments, bus_metriche = find_bus_route(
+        G, origin, dest, fermate, osm_bus_stops, ora)
+    if bus_metriche:
+        linea = bus_metriche.get("linea_bus", "")
+        linea_str = f" [{linea}]" if linea else ""
+        print(f"   🚶 Cammina fino a: {bus_metriche['fermata_partenza']} "
+              f"({bus_metriche['walk1_min']} min)")
+        print(f"   🚌 Bus{linea_str}: → {bus_metriche['fermata_arrivo']} "
+              f"({bus_metriche['bus_min']} min)")
+        print(f"   🚶 Cammina fino a destinazione ({bus_metriche['walk2_min']} min)")
+        print(f"   Distanza totale: {bus_metriche['distanza_km']} km")
+        print(f"   Tempo totale:    {bus_metriche['tempo_min']} min")
+        print(f"   Safety:          {bus_metriche['safety_score']}%")
+        print(f"   CO₂:             {bus_metriche['co2_kg']} kg")
     print()
 
     # --- FASE 6: Visualizzazione ---
-    if route_balanced:
-        visualize_route(G, route_balanced, lamps, metriche_balanced, "safewalk_balanced.html")
+    visualize_map(G, bike_segments, bike_metriche, bus_segments, bus_metriche,
+                  fermate_df=fermate, bike_df=bike)
     print()
 
-    # Mappa comparativa
-    routes_dict = {}
-    if route_balanced:
-        routes_dict["⚖️ Bilanciato"] = (route_balanced, metriche_balanced, "blue")
-    if route_safe:
-        routes_dict["🛡️ Più sicuro"] = (route_safe, metriche_safe, "green")
-    if route_fast:
-        routes_dict["⚡ Più veloce"] = (route_fast, metriche_fast, "red")
-
-    if routes_dict:
-        visualize_comparison(G, routes_dict, lamps, "safewalk_comparison.html")
-    print()
-
-    # --- FASE 7: Modello ML (bonus) ---
-    model = train_safety_model(G)
-    print()
-
-    # Tabella comparativa finale
+    # Riepilogo
     print("=" * 60)
-    print("  RIEPILOGO PERCORSI")
+    print("  RIEPILOGO")
     print("=" * 60)
-    print(f"{'Criterio':<20} {'Bilanciato':>12} {'Più sicuro':>12} {'Più veloce':>12}")
-    print("-" * 60)
-    for key in ["distanza_km", "tempo_piedi_min", "safety_score_medio", "co2_risparmiata_vs_auto_kg"]:
-        label = {
-            "distanza_km": "Distanza (km)",
-            "tempo_piedi_min": "Tempo (min)",
-            "safety_score_medio": "Safety (%)",
-            "co2_risparmiata_vs_auto_kg": "CO₂ risp. (kg)",
-        }[key]
-        vals = []
-        for m in [metriche_balanced, metriche_safe, metriche_fast]:
-            vals.append(str(m[key]) if m else "N/A")
-        print(f"{label:<20} {vals[0]:>12} {vals[1]:>12} {vals[2]:>12}")
+    print(f"{'':>20} {'🚲 Bici':>15} {'🚌 Bus':>15}")
+    print("-" * 55)
+    for key, label in [("distanza_km", "Distanza (km)"),
+                       ("tempo_min", "Tempo (min)"),
+                       ("safety_score", "Safety (%)"),
+                       ("co2_kg", "CO₂ (kg)")]:
+        v1 = str(bike_metriche.get(key, "N/A")) if bike_metriche else "N/A"
+        v2 = str(bus_metriche.get(key, "N/A")) if bus_metriche else "N/A"
+        print(f"{label:>20} {v1:>15} {v2:>15}")
     print()
-    print("✅ Pipeline completata! Controlla la cartella 'notebooks/output/' per le mappe.")
+    print("✅ Pipeline completata! Apri notebooks/output/safewalk_map.html")
 
 
 if __name__ == "__main__":

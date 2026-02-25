@@ -11,6 +11,8 @@ import time
 
 # Assicura che il modulo safewalk_pipeline sia importabile
 sys.path.insert(0, os.path.dirname(__file__))
+# Assicura che ai_challenge sia importabile
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from flask import Flask, render_template, request, jsonify, send_file
 import safewalk_pipeline as sw
@@ -22,25 +24,28 @@ pipeline = {}
 
 
 def init_pipeline():
-    """Carica grafo, lampioni, linee bus, CSV e arricchisci il grafo."""
+    """Carica grafo, rischio dal CSV, linee bus, CSV e arricchisci il grafo."""
     print("=" * 60)
     print("  SafeWalk Web — Inizializzazione pipeline")
     print("=" * 60)
     print()
 
     G = sw.build_walking_graph(use_cache=True)
-    lamps = sw.fetch_street_lamps(use_cache=True)
-    lamp_gdf = sw.lamps_to_geodataframe(lamps)
-    lit_way_ids = sw.fetch_lit_ways(use_cache=True)
     osm_bus_stops, line_info = sw.fetch_bus_routes(use_cache=True)
     fermate, bike, orari, consumi = sw.load_csv_data()
     sw.compute_transit_frequency(orari)
     sw.compute_avg_bus_co2(consumi)
     G = sw.enrich_graph_with_stops(G, fermate, bike)
-    G = sw.enrich_graph_with_lamps(G, lamp_gdf, lit_way_ids)
+
+    # Carica rischio archi dal CSV (sostituisce il calcolo dai lampioni)
+    risk_map = sw.load_edge_risk()
+    G = sw.enrich_graph_with_risk(G, risk_map)
 
     # Pre-calcola nodi per fermate e stazioni (UNA VOLTA)
     bus_nodes, bike_stations = sw.precompute_stop_nodes(G, fermate, bike)
+
+    # Pre-calcola layer sicurezza strade (UNA VOLTA, evita 56K iterazioni per richiesta)
+    safety_geojson = sw.precompute_safety_geojson(G)
 
     pipeline.update({
         "G": G,
@@ -50,6 +55,7 @@ def init_pipeline():
         "line_info": line_info,
         "bus_nodes": bus_nodes,
         "bike_stations": bike_stations,
+        "safety_geojson": safety_geojson,
     })
 
     print()
@@ -77,7 +83,7 @@ def api_compute():
     """Calcola il/i percorso/i e genera la mappa."""
     data = request.json
     ora = int(data.get("orario", 12))
-    tipo = data.get("tipo", "completo")  # veloce | sostenibile | completo
+    tipo = data.get("tipo", "veloce")  # veloce | sostenibile | sicuro | personalizzata
 
     G = pipeline["G"]
     fermate = pipeline["fermate"]
@@ -112,20 +118,78 @@ def api_compute():
 
     bike_segments, bike_metriche = None, None
     bus_segments, bus_metriche = None, None
+    safe_segments, safe_metriche = None, None
+    custom_segments, custom_metriche = None, None
 
-    if tipo in ("sostenibile", "completo"):
+    if tipo == "sostenibile":
         bike_segments, bike_metriche = sw.find_bike_route(
             G, origin, dest, bike_df, ora, precomputed_bike=bike_stations)
 
-    if tipo in ("veloce", "completo"):
+    elif tipo == "veloce":
         bus_segments, bus_metriche = sw.find_bus_route(
             G, origin, dest, fermate, osm_bus_stops, ora,
             precomputed_bus=bus_nodes)
 
-    # Genera mappa leggera (solo percorsi, veloce)
+    elif tipo == "sicuro":
+        safe_segments, safe_metriche = sw.find_safe_route(G, origin, dest, ora)
+
+    elif tipo == "personalizzata":
+        # Pesi dall'utente (0-100), normalizzati a 0-1
+        w_sicurezza = float(data.get("w_sicurezza", 33)) / 100.0
+        w_ecologia = float(data.get("w_ecologia", 33)) / 100.0
+        w_velocita = float(data.get("w_velocita", 34)) / 100.0
+
+        # Normalizza i pesi perché la somma sia 1
+        total_w = w_sicurezza + w_ecologia + w_velocita
+        if total_w > 0:
+            w_sicurezza /= total_w
+            w_ecologia /= total_w
+            w_velocita /= total_w
+
+        try:
+            from ai_challenge.graph.router import find_all_routes
+
+            routes = find_all_routes(
+                G,
+                start_lat=origin[0], start_lon=origin[1],
+                end_lat=dest[0], end_lon=dest[1],
+                pref_tempo=w_velocita,
+                pref_ecologia=w_ecologia,
+                pref_sicurezza=w_sicurezza,
+            )
+            # Usa il percorso a piedi come base per il routing personalizzato
+            walk_route = routes.get("piedi")
+            if walk_route and walk_route.get("path"):
+                path = walk_route["path"]
+                info = walk_route.get("info", {})
+                custom_segments = [
+                    {"type": "walk", "route": path,
+                     "info": f"⚙️ Percorso personalizzato (Sic:{w_sicurezza:.0%} Eco:{w_ecologia:.0%} Vel:{w_velocita:.0%})"},
+                ]
+                custom_metriche = {
+                    "distanza_km": round(info.get("distanza_km", 0), 2),
+                    "tempo_min": round(info.get("tempo_totale_min", 0), 1),
+                    "safety_score": round(info.get("sic_media", 0) * 100, 1),
+                    "co2_kg": round(info.get("eco_totale_kg_co2", 0), 3),
+                    "mezzo": "⚙️ Personalizzato",
+                }
+        except Exception as e:
+            print(f"   ⚠️ Errore routing personalizzato: {e}")
+            import traceback
+            traceback.print_exc()
+
+    # Genera mappa con layer sicurezza strade (precomputed)
     sw.visualize_map_light(
-        G, bike_segments, bike_metriche,
-        bus_segments, bus_metriche,
+        G,
+        bike_segments=bike_segments,
+        bike_metriche=bike_metriche,
+        bus_segments=bus_segments,
+        bus_metriche=bus_metriche,
+        safe_segments=safe_segments,
+        safe_metriche=safe_metriche,
+        custom_segments=custom_segments,
+        custom_metriche=custom_metriche,
+        safety_geojson=pipeline.get("safety_geojson"),
         filename="route_map.html",
     )
 
@@ -134,10 +198,13 @@ def api_compute():
         "dest": list(dest),
         "bike": bike_metriche,
         "bus": bus_metriche,
+        "safe": safe_metriche,
+        "custom": custom_metriche,
         "is_night": is_night,
         "map_url": f"/map?t={int(time.time())}",
         "summary": _build_summary(
-            bike_metriche, bus_metriche, tipo, ora, partenza, destinazione, is_night
+            bike_metriche, bus_metriche, safe_metriche, custom_metriche,
+            tipo, ora, partenza, destinazione, is_night
         ),
     }
     return jsonify(result)
@@ -154,7 +221,7 @@ def api_chat():
 
 
 # ── Generazione risposte chatbot ─────────────────────────────────────────
-def _build_summary(bike, bus, tipo, ora, partenza, destinazione, is_night):
+def _build_summary(bike, bus, safe, custom, tipo, ora, partenza, destinazione, is_night):
     """Genera il sommario HTML che il chatbot mostra dopo il calcolo."""
     parts = [
         f"Ecco i risultati per <b>{partenza}</b> → <b>{destinazione}</b> "
@@ -166,6 +233,26 @@ def _build_summary(bike, bus, tipo, ora, partenza, destinazione, is_night):
             "hanno ricevuto un bonus di sicurezza.</i>"
         )
     parts.append("")
+
+    if safe:
+        parts.append("<b>🛡️ Percorso Sicuro:</b>")
+        parts.append(
+            f"📏 {safe['distanza_km']} km &nbsp;|&nbsp; "
+            f"⏱️ {safe['tempo_min']} min &nbsp;|&nbsp; "
+            f"🛡️ Sicurezza: <b>{safe['safety_score']}%</b> &nbsp;|&nbsp; "
+            f"🌱 0 kg CO₂"
+        )
+        parts.append("")
+
+    if custom:
+        parts.append("<b>⚙️ Percorso Personalizzato:</b>")
+        parts.append(
+            f"📏 {custom['distanza_km']} km &nbsp;|&nbsp; "
+            f"⏱️ {custom['tempo_min']} min &nbsp;|&nbsp; "
+            f"🛡️ {custom['safety_score']}% &nbsp;|&nbsp; "
+            f"🌱 {custom['co2_kg']} kg CO₂"
+        )
+        parts.append("")
 
     if bike:
         parts.append("<b>🚲 Percorso Bici (sostenibile):</b>")
@@ -207,7 +294,8 @@ def _build_summary(bike, bus, tipo, ora, partenza, destinazione, is_night):
         )
         parts.append("")
 
-    if not bike and not bus:
+    has_any = bike or bus or safe or custom
+    if not has_any:
         parts.append(
             "❌ Non è stato possibile calcolare alcun percorso. "
             "Prova con luoghi diversi."
@@ -296,7 +384,7 @@ def _handle_discussion(message, result):
         if not bus:
             return (
                 "Non ho calcolato un percorso bus. "
-                "Prova con modalità <b>Veloce</b> o <b>Completo</b>."
+                "Prova con modalità <b>Veloce</b>."
             )
         linea = bus.get("linea_bus", "")
         parts = [
@@ -328,7 +416,7 @@ def _handle_discussion(message, result):
         if not bike:
             return (
                 "Non ho calcolato un percorso bici. "
-                "Prova con modalità <b>Sostenibile</b> o <b>Completo</b>."
+                "Prova con modalità <b>Sostenibile</b>."
             )
         parts = [
             "🚲 <b>Dettagli percorso Bici:</b>",

@@ -312,6 +312,21 @@ def load_csv_data():
     return fermate, bike, orari, consumi
 
 
+def load_edge_risk():
+    """Carica il file bari_edges_risk.csv e restituisce un dizionario
+    {(u, v, key): {"risk_score": float, "risk_category": str}}."""
+    csv_path = DATA_DIR / "bari_edges_risk.csv"
+    print(f"📂 Caricamento rischio archi da {csv_path}...")
+    df = pd.read_csv(csv_path, usecols=["u", "v", "key", "risk_score", "risk_category"])
+    # Vectorized: molto più veloce di iterrows()
+    keys = list(zip(df["u"].astype(int), df["v"].astype(int), df["key"].astype(int)))
+    vals = [{"risk_score": float(r), "risk_category": str(c)}
+            for r, c in zip(df["risk_score"], df["risk_category"])]
+    risk_map = dict(zip(keys, vals))
+    print(f"   ✅ Rischio caricato per {len(risk_map)} archi")
+    return risk_map
+
+
 def compute_transit_frequency(orari):
     """
     Calcola la frequenza di transiti per quartiere e ora.
@@ -511,14 +526,14 @@ def enrich_graph_with_lamps(G, lamp_gdf, lit_way_ids=None):
     n_with_lamps = sum(1 for u, v, k in G.edges(keys=True) if G[u][v][k]["lamp_count"] > 0)
     n_is_lit = sum(1 for u, v, k in G.edges(keys=True) if G[u][v][k]["is_lit"])
     scores = [G[u][v][k]["safety_normalized"] for u, v, k in G.edges(keys=True)]
-    n_safe = sum(1 for s in scores if s >= 0.6)
-    n_medium = sum(1 for s in scores if 0.15 < s < 0.6)
-    n_danger = sum(1 for s in scores if s <= 0.15)
+    n_safe = sum(1 for s in scores if s >= 0.65)
+    n_medium = sum(1 for s in scores if 0.25 < s < 0.65)
+    n_danger = sum(1 for s in scores if s <= 0.25)
     print(f"   ✅ Archi con almeno 1 lampione: {n_with_lamps}/{G.number_of_edges()}")
     print(f"   ✅ Archi illuminati (is_lit): {n_is_lit}/{G.number_of_edges()}")
     print(f"   ✅ Distribuzione sicurezza:")
-    print(f"      🟢 Sicuro (≥0.75):  {n_safe}")
-    print(f"      🟠 Medio (0.25-0.75): {n_medium}")
+    print(f"      🟢 Sicuro (≥0.65):  {n_safe}")
+    print(f"      🟠 Medio (0.25-0.65): {n_medium}")
     print(f"      🔴 Pericolo (≤0.25): {n_danger}")
     return G
 
@@ -557,6 +572,53 @@ def enrich_graph_with_stops(G, fermate, bike):
         except Exception:
             pass
     print(f"   Stazioni bike sharing associate: {bike_count}")
+    return G
+
+
+def enrich_graph_with_risk(G, risk_map):
+    """Arricchisce il grafo con i dati di rischio dal CSV.
+    Per ogni arco, assegna safety_normalized (invertito: più è alto, più è sicuro)
+    e risk_category per la visualizzazione."""
+    print("🔧 Arricchimento grafo con dati di rischio dal CSV...")
+
+    # Trovo il max risk_score per normalizzare
+    max_risk = max((v["risk_score"] for v in risk_map.values()), default=1.0)
+    if max_risk <= 0:
+        max_risk = 1.0
+
+    matched = 0
+    unmatched = 0
+    for u, v, k in G.edges(keys=True):
+        key = (u, v, k)
+        if key in risk_map:
+            rs = risk_map[key]["risk_score"]
+            cat = risk_map[key]["risk_category"]
+            # safety_normalized: 1 = sicuro, 0 = pericoloso
+            safety = max(0.0, min(1.0, 1.0 - (rs / max_risk)))
+            G[u][v][k]["safety_normalized"] = safety
+            G[u][v][k]["safety_base"] = safety
+            G[u][v][k]["risk_score"] = rs
+            G[u][v][k]["risk_category"] = cat
+            matched += 1
+        else:
+            # Arco non presente nel CSV: assegna sicurezza media
+            G[u][v][k]["safety_normalized"] = 0.5
+            G[u][v][k]["safety_base"] = 0.5
+            G[u][v][k]["risk_score"] = 0.0
+            G[u][v][k]["risk_category"] = "Sconosciuto"
+            unmatched += 1
+
+    # Statistiche
+    scores = [G[u][v][k]["safety_normalized"] for u, v, k in G.edges(keys=True)]
+    n_safe = sum(1 for s in scores if s >= 0.6)
+    n_medium = sum(1 for s in scores if 0.15 < s < 0.6)
+    n_danger = sum(1 for s in scores if s <= 0.15)
+    print(f"   ✅ Archi con rischio dal CSV: {matched}/{G.number_of_edges()}")
+    print(f"   ⚠️ Archi senza dati (default 0.5): {unmatched}")
+    print(f"   ✅ Distribuzione sicurezza:")
+    print(f"      🟢 Sicuro (≥0.60):  {n_safe}")
+    print(f"      🟠 Medio (0.15-0.60): {n_medium}")
+    print(f"      🔴 Pericolo (≤0.15): {n_danger}")
     return G
 
 
@@ -983,14 +1045,63 @@ def find_bus_route(G, origin_latlon, dest_latlon, fermate_df,
     return segments, metriche
 
 
+def find_safe_route(G, origin_latlon, dest_latlon, ora=12):
+    """
+    Calcola il percorso più sicuro a piedi da partenza a destinazione.
+    Il peso di ogni arco è inversamente proporzionale alla sicurezza.
+    Ritorna (segments, metriche).
+    """
+    orig = ox.nearest_nodes(G, origin_latlon[1], origin_latlon[0])
+    dest = ox.nearest_nodes(G, dest_latlon[1], dest_latlon[0])
+
+    def safety_weight(u, v, data):
+        """Peso che penalizza strade pericolose."""
+        length_km = data.get("length", 1) / 1000
+        safety = float(data.get("safety_normalized", 0.5))
+        # Inversione: più è pericolosa, più pesa
+        risk_factor = 1.0 - safety  # 0 = sicura, 1 = pericolosa
+        return (0.8 * risk_factor + 0.2) * length_km
+
+    try:
+        path = nx.shortest_path(G, orig, dest, weight=safety_weight)
+    except nx.NetworkXNoPath:
+        print("   ❌ Nessun percorso sicuro trovato!")
+        return None, None
+
+    total_m = _path_length(G, path)
+    walk_time = (total_m / 1000 / WALKING_SPEED_KMH) * 60
+
+    # Safety score medio
+    total_safety, n_e = 0.0, 0
+    for i in range(len(path) - 1):
+        u, v = path[i], path[i + 1]
+        ed = G[u][v][0] if 0 in G[u][v] else G[u][v][list(G[u][v].keys())[0]]
+        total_safety += float(ed.get("safety_normalized", 0))
+        n_e += 1
+
+    segments = [
+        {"type": "walk", "route": path,
+         "info": "🛡️ Percorso più sicuro a piedi"},
+    ]
+
+    metriche = {
+        "distanza_km": round(total_m / 1000, 2),
+        "tempo_min": round(walk_time, 1),
+        "safety_score": round((total_safety / max(n_e, 1)) * 100, 1),
+        "co2_kg": 0.0,
+        "mezzo": "🛡️ Sicuro",
+    }
+    return segments, metriche
+
+
 # ===========================================================================
 # FASE 6: Visualizzazione con Folium
 # ===========================================================================
 def _safety_color(safety_norm):
     """>=0.75 verde (sicuro), <=0.25 rosso (pericolo), resto arancione."""
-    if safety_norm >= 0.6:
+    if safety_norm >= 0.65:
         return "green"
-    elif safety_norm > 0.15:
+    elif safety_norm > 0.25:
         return "orange"
     else:
         return "red"
@@ -1267,15 +1378,53 @@ def visualize_map(G, bike_segments, bike_metriche, bus_segments, bus_metriche,
     return m
 
 
-def visualize_map_light(G, bike_segments, bike_metriche, bus_segments,
-                        bus_metriche, filename="route_map.html"):
-    """Versione leggera della mappa: disegna SOLO i percorsi calcolati,
-    senza il layer sicurezza (51K archi) né tutte le fermate. Molto più veloce."""
+def precompute_safety_geojson(G):
+    """Pre-calcola i dati GeoJSON per il layer sicurezza strade.
+    Deve essere chiamata UNA VOLTA all'avvio, non per ogni richiesta.
+    Ritorna una lista di dict pronti per folium."""
+    import time as _time
+    t0 = _time.time()
+    print("🟢 Pre-calcolo layer sicurezza strade...")
+    features = []
+    for u, v, k, data in G.edges(data=True, keys=True):
+        safety = float(data.get("safety_normalized", 0.5))
+        color = _safety_color(safety)
+        if "geometry" in data:
+            coords = [(lat, lon) for lon, lat in data["geometry"].coords]
+        else:
+            try:
+                coords = [
+                    (float(G.nodes[u]["y"]), float(G.nodes[u]["x"])),
+                    (float(G.nodes[v]["y"]), float(G.nodes[v]["x"])),
+                ]
+            except (KeyError, ValueError):
+                continue
+        cat = data.get("risk_category", "Sconosciuto")
+        rs = data.get("risk_score", 0)
+        features.append({
+            "coords": coords,
+            "color": color,
+            "tooltip": f"Sicurezza: {safety:.0%} | Rischio: {rs:.1f} | {cat}",
+        })
+    print(f"   ✅ Pre-calcolati {len(features)} archi in {_time.time()-t0:.1f}s")
+    return features
+
+
+def visualize_map_light(G, segments_list=None, bike_segments=None,
+                        bike_metriche=None, bus_segments=None,
+                        bus_metriche=None, safe_segments=None,
+                        safe_metriche=None, custom_segments=None,
+                        custom_metriche=None,
+                        safety_geojson=None,
+                        filename="route_map.html"):
+    """Versione della mappa con layer sicurezza strade e percorsi calcolati.
+    Se safety_geojson è fornito, usa dati precalcolati (veloce).
+    Altrimenti itera il grafo (lento)."""
     import folium
 
     center_lat, center_lon = 41.117, 16.87
     all_nodes = []
-    for segs in [bike_segments, bus_segments]:
+    for segs in [bike_segments, bus_segments, safe_segments, custom_segments]:
         if segs:
             for seg in segs:
                 all_nodes.extend(seg["route"])
@@ -1285,6 +1434,66 @@ def visualize_map_light(G, bike_segments, bike_metriche, bus_segments,
 
     m = folium.Map(location=[center_lat, center_lon], zoom_start=15,
                    tiles="cartodbpositron")
+
+    # --- Layer: sicurezza strade (colorato) ---
+    safety_grp = folium.FeatureGroup(name="🛡️ Sicurezza strade", show=True)
+    if safety_geojson:
+        # Usa dati pre-calcolati (veloce!)
+        for feat in safety_geojson:
+            folium.PolyLine(
+                feat["coords"], color=feat["color"],
+                weight=2, opacity=0.5, tooltip=feat["tooltip"]
+            ).add_to(safety_grp)
+    else:
+        # Fallback: itera il grafo (lento)
+        for u, v, k, data in G.edges(data=True, keys=True):
+            safety = float(data.get("safety_normalized", 0.5))
+            color = _safety_color(safety)
+            if "geometry" in data:
+                coords = [(lat, lon) for lon, lat in data["geometry"].coords]
+            else:
+                try:
+                    coords = [
+                        (float(G.nodes[u]["y"]), float(G.nodes[u]["x"])),
+                        (float(G.nodes[v]["y"]), float(G.nodes[v]["x"])),
+                    ]
+                except (KeyError, ValueError):
+                    continue
+            cat = data.get("risk_category", "Sconosciuto")
+            rs = data.get("risk_score", 0)
+            tooltip = f"Sicurezza: {safety:.0%} | Rischio: {rs:.1f} | {cat}"
+            folium.PolyLine(coords, color=color, weight=2, opacity=0.5,
+                            tooltip=tooltip).add_to(safety_grp)
+    safety_grp.add_to(m)
+
+    # --- Percorso sicuro ---
+    if safe_segments and safe_metriche:
+        safe_grp = folium.FeatureGroup(name="🛡️ Percorso Sicuro", show=True)
+        for seg in safe_segments:
+            sc = _path_coords(G, seg["route"])
+            if len(sc) < 2:
+                continue
+            folium.PolyLine(sc, color="#2E7D32", weight=6, opacity=0.9,
+                            popup=seg["info"]).add_to(safe_grp)
+        safe_grp.add_to(m)
+
+    # --- Percorso personalizzato ---
+    if custom_segments and custom_metriche:
+        custom_grp = folium.FeatureGroup(name="⚙️ Percorso Personalizzato", show=True)
+        seg_styles = {
+            "walk": {"color": "#FF6F00", "weight": 4, "dash_array": "5 10"},
+            "bike": {"color": "#E65100", "weight": 6},
+            "bus": {"color": "#E65100", "weight": 6},
+            "drive": {"color": "#E65100", "weight": 6},
+        }
+        for seg in custom_segments:
+            sc = _path_coords(G, seg["route"])
+            if len(sc) < 2:
+                continue
+            st = seg_styles.get(seg.get("type", "walk"), seg_styles["walk"])
+            opts = {"opacity": 0.9, "popup": seg.get("info", ""), **st}
+            folium.PolyLine(sc, **opts).add_to(custom_grp)
+        custom_grp.add_to(m)
 
     # --- Percorso bici ---
     if bike_segments and bike_metriche:
@@ -1353,12 +1562,12 @@ def visualize_map_light(G, bike_segments, bike_metriche, bus_segments,
 
     # --- Marker partenza e arrivo ---
     first_route = None
-    if bike_segments:
-        first_route = bike_segments[0]["route"]
-        last_route = bike_segments[-1]["route"]
-    elif bus_segments:
-        first_route = bus_segments[0]["route"]
-        last_route = bus_segments[-1]["route"]
+    last_route = None
+    for segs in [safe_segments, custom_segments, bike_segments, bus_segments]:
+        if segs:
+            if first_route is None:
+                first_route = segs[0]["route"]
+            last_route = segs[-1]["route"]
     if first_route:
         folium.Marker(
             (float(G.nodes[first_route[0]]["y"]),
@@ -1372,6 +1581,19 @@ def visualize_map_light(G, bike_segments, bike_metriche, bus_segments,
             popup="🔴 Arrivo",
             icon=folium.Icon(color="red", icon="stop"),
         ).add_to(m)
+
+    # --- Legenda ---
+    legend_html = """
+    <div style="position:fixed; bottom:30px; left:30px; z-index:1000;
+                background:white; padding:12px 16px; border-radius:8px;
+                border:2px solid grey; font-size:13px; line-height:1.8;">
+        <b>Pericolosità strade</b><br>
+        <span style="color:green;">&#9644;</span> Sicura<br>
+        <span style="color:orange;">&#9644;</span> Media<br>
+        <span style="color:red;">&#9644;</span> Pericolosa
+    </div>
+    """
+    m.get_root().html.add_child(folium.Element(legend_html))
 
     folium.LayerControl().add_to(m)
     output_path = OUTPUT_DIR / filename

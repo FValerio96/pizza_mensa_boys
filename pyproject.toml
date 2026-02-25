@@ -1,9 +1,39 @@
+[build-system]
+requires = ["flit_core >=3.2,<4"]
+build-backend = "flit_core.buildapi"
+
 [project]
-name = "pizza-mensa-boys"
-version = "0.1.0"
-description = "Add your description here"
-readme = "README.md"
-requires-python = ">=3.10"
-dependencies = [
-    "cookiecutter-data-science>=2.3.0",
+name = "ai_challenge"
+version = "0.0.1"
+description = "Ai challenge"
+authors = [
+  { name = "Pizza_Mensa_Boys" },
 ]
+
+readme = "README.md"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    
+]
+dependencies = [
+    "mkdocs",
+    "pip",
+    "pytest",
+    "python-dotenv",
+    "ruff",
+]
+requires-python = "~=3.10.0"
+
+
+[tool.ruff]
+line-length = 99
+src = ["ai_challenge"]
+include = ["pyproject.toml", "ai_challenge/**/*.py"]
+
+[tool.ruff.lint]
+extend-select = ["I"]  # Add import sorting
+
+[tool.ruff.lint.isort]
+known-first-party = ["ai_challenge"]
+force-sort-within-sections = true
+
